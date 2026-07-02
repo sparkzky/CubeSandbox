@@ -1,0 +1,16 @@
+[package]
+name = "cube-gpu-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+libc = "0.2"
+libloading = "0.8"
+nix = { version = "0.27", features = ["mman", "socket", "vsock"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+thiserror = "1"
+byteorder = "1"

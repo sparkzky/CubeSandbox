@@ -387,6 +387,28 @@ impl Container {
             "true".to_string(),
         );
 
+        if let Some(ref gpu_cfg) = self.sb_conf.gpu {
+            if gpu_cfg.enable {
+                let gpu_int = crate::sandbox::gpu::GpuIntegration::from_config(
+                    &Some(gpu_cfg.clone()),
+                )
+                .unwrap();
+                let sandbox_id_hash = {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    self.sandbox_id.hash(&mut hasher);
+                    hasher.finish()
+                };
+                let env_pairs = gpu_int.env_vars(sandbox_id_hash);
+                let proc = spec.mut_process();
+                let mut envs = proc.get_env().to_vec();
+                for (k, v) in env_pairs {
+                    envs.push(format!("{}={}", k, v));
+                }
+                proc.set_env(envs.into());
+            }
+        }
+
         Ok(spec)
     }
 

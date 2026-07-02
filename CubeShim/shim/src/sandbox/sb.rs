@@ -16,6 +16,7 @@ use crate::hypervisor::cube_hypervisor as CH;
 use crate::hypervisor::snapshot::{enable_snapshot, SnapshotInfo};
 use crate::log::{stat_defer, Log};
 use crate::sandbox::config;
+use crate::sandbox::gpu::GpuIntegration;
 use crate::{debugf, errf, infof, warnf};
 use chrono::{DateTime, Utc};
 use containerd_shim::event::Event;
@@ -752,6 +753,17 @@ impl SandBox {
 
         for param in self.conf.extra_kernel_params.iter() {
             vc.add_cmdline(param.clone());
+        }
+
+        if let Some(gpu_int) = GpuIntegration::from_config(&self.conf.gpu) {
+            let sandbox_id_hash = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                self.id.hash(&mut hasher);
+                hasher.finish()
+            };
+            let shm_path = gpu_int.ivshmem_backing_file_path(sandbox_id_hash);
+            vc.set_ivshmem(std::path::PathBuf::from(&shm_path), gpu_int.shm_size_mb as usize);
         }
 
         Ok(vc)

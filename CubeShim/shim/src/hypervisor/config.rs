@@ -17,8 +17,8 @@ use crate::sandbox::pmem::Pmem;
 
 use cube_hypervisor::config::{RateLimiterConfig, TokenBucketConfig};
 use cube_hypervisor::vm_config::{
-    ConsoleConfig, ConsoleOutputMode, CpuTopology, DiskConfig, FsConfig, MacAddr, NetConfig,
-    PayloadConfig, PmemConfig, RngConfig, VmConfig as VC, VsockConfig,
+    ConsoleConfig, ConsoleOutputMode, CpuTopology, DiskConfig, FsConfig, IvshmemConfig, MacAddr,
+    NetConfig, PayloadConfig, PmemConfig, RngConfig, VmConfig as VC, VsockConfig,
 };
 use cube_hypervisor::vmm_config::VmmConfig;
 
@@ -66,6 +66,7 @@ pub struct VmConfig {
     pub vsock: Option<VsockConfig>,
     pub sys_ctrl: bool,
     pub rng: RngConfig,
+    pub ivshmem: Option<IvshmemConfig>,
 }
 
 impl Default for VmConfig {
@@ -123,6 +124,7 @@ impl Default for VmConfig {
                 src: PathBuf::from("/dev/urandom"),
                 iommu: false,
             },
+            ivshmem: None,
         }
     }
 }
@@ -169,6 +171,7 @@ impl VmConfig {
         if let Some(vs) = self.vsock.clone() {
             vc.vsock = Some(vs)
         }
+        vc.ivshmem = self.ivshmem.clone();
         vc
     }
 
@@ -329,6 +332,14 @@ impl VmConfig {
 
     pub fn add_vsock(&mut self, id: String) -> &mut Self {
         self.vsock = Some(Utils::gen_vsock_config(&id));
+        self
+    }
+
+    pub fn set_ivshmem(&mut self, path: PathBuf, size_mb: usize) -> &mut Self {
+        self.ivshmem = Some(IvshmemConfig {
+            path,
+            size: size_mb << 20,
+        });
         self
     }
 }

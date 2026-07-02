@@ -15,6 +15,20 @@ use std::collections::HashMap;
 
 use super::device::{self, Device, DeviceDisk};
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GpuConfig {
+    #[serde(default)]
+    pub enable: bool,
+    #[serde(default = "default_gpu_memory_quota")]
+    pub memory_quota_mb: u64,
+    #[serde(default)]
+    pub vsock_port: u32,
+}
+
+fn default_gpu_memory_quota() -> u64 {
+    4096
+}
+
 pub const ANNO_VM_RES: &str = "cube.vmmres";
 pub const ANNO_VMM_FS: &str = "cube.fs";
 pub const ANNO_VIRTIOFS: &str = "cube.virtiofs";
@@ -28,6 +42,7 @@ pub const ANNO_SNAPSHOT_BASE: &str = "cube.vm.snapshot.base.path";
 pub const ANNO_SNAPSHOT_MEMORY_VOL_URL: &str = "cube.vm.snapshot.memory_vol_url";
 pub const ANNO_APP_SNAPSHOT_CREATE: &str = "cube.appsnapshot.create";
 pub const ANNO_APP_SNAPSHOT_RESTORE: &str = "cube.appsnapshot.restore";
+pub const ANNO_GPU: &str = "cube.gpu";
 
 pub const SHARE_CACHE_ALWAYS: u8 = 1;
 pub const SHARE_CACHE_NEVER: u8 = 2;
@@ -60,6 +75,7 @@ pub struct Config {
     pub app_snapshot_restore: bool,
     /// Extra kernel cmdline parameters injected through annotations.
     pub extra_kernel_params: Vec<String>,
+    pub gpu: Option<GpuConfig>,
 }
 
 impl Config {
@@ -173,6 +189,12 @@ impl Config {
         if let Some(anno) = anno.get(ANNO_VIRTIOFS) {
             virtiofs = Utils::anno_to_obj::<Vec<VirtioFs>>(anno)?;
         }
+        let gpu = if let Some(gpu_anno) = anno.get(ANNO_GPU) {
+            Some(Utils::anno_to_obj::<GpuConfig>(gpu_anno)?)
+        } else {
+            None
+        };
+
         let extra_kernel_params = if let Some(params) = anno.get(ANNO_VM_KERNEL_CMDLINE_APPEND) {
             let params_vec = Utils::anno_to_obj::<Vec<String>>(params)?;
             params_vec
@@ -212,6 +234,7 @@ impl Config {
             app_snapshot_create,
             app_snapshot_restore,
             extra_kernel_params,
+            gpu,
         };
         Ok(c)
     }

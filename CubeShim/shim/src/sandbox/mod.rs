@@ -5,6 +5,7 @@
 pub mod config;
 pub mod device;
 pub mod disk;
+pub mod gpu;
 pub mod net;
 pub mod pmem;
 pub mod sb;
