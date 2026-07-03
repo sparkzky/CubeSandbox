@@ -1,17 +1,22 @@
 // Copyright (c) 2024 Tencent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(feature = "vsock")]
 use std::sync::Arc;
+#[cfg(feature = "vsock")]
 use tokio::net::VsockListener;
+#[cfg(feature = "vsock")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "vsock")]
 use tracing::{info, error, warn};
 
+#[cfg(feature = "vsock")]
 use crate::session::SessionManager;
-
-const RPC_HEADER_SIZE: usize = std::mem::size_of::<RpcHeader>();
 
 include!("../../proto/rpc_protocol.rs.inc");
 
+const RPC_HEADER_SIZE: usize = std::mem::size_of::<RpcHeader>();
+#[cfg(feature = "vsock")]
 pub async fn run(port: u32, session_mgr: Arc<SessionManager>) -> Result<(), Box<dyn std::error::Error>> {
     let listener = VsockListener::bind(nix::sys::socket::VsockAddr::new(
         nix::sys::socket::VMADDR_CID_ANY,
@@ -32,6 +37,7 @@ pub async fn run(port: u32, session_mgr: Arc<SessionManager>) -> Result<(), Box<
     }
 }
 
+#[cfg(feature = "vsock")]
 async fn handle_connection(
     mut stream: tokio::net::VsockStream,
     cid: u32,
@@ -73,6 +79,7 @@ async fn handle_connection(
     Ok(())
 }
 
+#[cfg(feature = "vsock")]
 fn parse_header(buf: &[u8]) -> RpcHeader {
     RpcHeader {
         magic: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
@@ -86,6 +93,7 @@ fn parse_header(buf: &[u8]) -> RpcHeader {
     }
 }
 
+#[cfg(feature = "vsock")]
 fn serialize_header(hdr: &RpcHeader) -> Vec<u8> {
     let mut buf = Vec::with_capacity(RPC_HEADER_SIZE);
     buf.extend_from_slice(&hdr.magic.to_le_bytes());

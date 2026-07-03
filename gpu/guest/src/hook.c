@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <stdint.h>
+#include <unistd.h>
 
 #include "cuda_defs.h"
 #include "rpc_client.h"
