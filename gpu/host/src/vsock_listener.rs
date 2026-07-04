@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #[cfg(feature = "vsock")]
-use std::sync::Arc;
+use tokio_vsock::{VsockListener, VsockAddr, VMADDR_CID_ANY};
 #[cfg(feature = "vsock")]
-use tokio::net::VsockListener;
+use std::sync::Arc;
 #[cfg(feature = "vsock")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(feature = "vsock")]
@@ -18,10 +18,7 @@ include!("../../proto/rpc_protocol.rs.inc");
 const RPC_HEADER_SIZE: usize = std::mem::size_of::<RpcHeader>();
 #[cfg(feature = "vsock")]
 pub async fn run(port: u32, session_mgr: Arc<SessionManager>) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = VsockListener::bind(nix::sys::socket::VsockAddr::new(
-        nix::sys::socket::VMADDR_CID_ANY,
-        port,
-    ))?;
+    let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port))?;
 
     loop {
         let (stream, addr) = listener.accept().await?;
@@ -39,7 +36,7 @@ pub async fn run(port: u32, session_mgr: Arc<SessionManager>) -> Result<(), Box<
 
 #[cfg(feature = "vsock")]
 async fn handle_connection(
-    mut stream: tokio::net::VsockStream,
+    mut stream: tokio_vsock::VsockStream,
     cid: u32,
     session_mgr: Arc<SessionManager>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -54,8 +51,9 @@ async fn handle_connection(
         }
 
         let hdr = parse_header(&hdr_buf);
-        if hdr.magic != CUBE_GPU_RPC_MAGIC {
-            warn!("Invalid magic from CID {}: 0x{:08x}", cid, hdr.magic);
+        let magic = hdr.magic;
+        if magic != CUBE_GPU_RPC_MAGIC {
+            warn!("Invalid magic from CID {}: 0x{:08x}", cid, magic);
             break;
         }
 

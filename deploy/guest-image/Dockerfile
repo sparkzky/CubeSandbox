@@ -18,4 +18,9 @@ RUN yum install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
            /usr/share/locale/* /usr/lib/locale/* \
            /tmp/* /var/tmp/*
 
+# GPU remoting support: install the guest-side CUDA interception library.
+# Built from gpu/guest/src/ (see gpu/README.md). The shim injects this path
+# as LD_PRELOAD when cube.gpu annotation is set on the sandbox.
+COPY libcube-gpu.so /usr/lib/cube-gpu/libcube-gpu.so
+
 CMD ["bash"]

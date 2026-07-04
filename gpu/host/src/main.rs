@@ -39,18 +39,9 @@ async fn main() {
 
     let session_mgr = session::SessionManager::new(cuda, shm_mgr);
 
-    #[cfg(feature = "vsock")]
-    {
-        info!("Listening on vsock port {}", port);
-        if let Err(e) = vsock_listener::run(port, session_mgr).await {
-            error!("Listener error: {:?}", e);
-            std::process::exit(1);
-        }
-    }
-    #[cfg(not(feature = "vsock"))]
-    {
-        let _ = session_mgr;
-        let _ = port;
-        info!("cube-gpu-daemon built without vsock transport; CUDA runtime initialized successfully");
+    info!("Listening on vsock port {}", port);
+    if let Err(e) = vsock_listener::run(port, session_mgr).await {
+        error!("Listener error: {:?}", e);
+        std::process::exit(1);
     }
 }

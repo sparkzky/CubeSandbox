@@ -51,3 +51,10 @@ __pycache__
 /tests
 
 web/tsconfig.tsbuildinfo
+.worktrees/
+
+# GPU build artifacts
+gpu/guest/src/*.o
+gpu/guest/src/libcube-gpu.so
+deploy/guest-image/libcube-gpu.so
+deploy/one-click/assets/kernel-artifacts/vmlinux
