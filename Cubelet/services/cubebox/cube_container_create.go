@@ -440,6 +440,15 @@ func (l *local) genSandboxOptions(ctx context.Context, realReq *cubebox.RunCubeS
 			constants.AnnotationsSandboxDNS: string(data),
 		}))
 	}
+	// Forward the cube.gpu sandbox annotation into the pod container's OCI spec
+	// annotations so the cube shim (containerd-shim-cube-rs) can parse it and
+	// inject the GPU LD_PRELOAD / CUBE_GPU_* env vars and ivshmem device for the
+	// workload container. See CubeShim/shim/src/sandbox/{config.rs,gpu.rs}.
+	if gpuAnno, ok := realReq.GetAnnotations()[constants.AnnotationsGPU]; ok && gpuAnno != "" {
+		additionalSandboxOpt = append(additionalSandboxOpt, oci.WithAnnotations(map[string]string{
+			constants.AnnotationsGPU: gpuAnno,
+		}))
+	}
 	err = l.genImageReferenceForCubebox(ctx, flowOpts, sandBox)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate image reference for cubebox: %w", err)

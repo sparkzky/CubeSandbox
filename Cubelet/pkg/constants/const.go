@@ -216,6 +216,7 @@ const (
 
 const (
 	AnnotationPmem          = "cube.pmem"
+	AnnotationsGPU          = "cube.gpu"
 	AnnotationsVFIONet      = "cube.vfio.net"
 	AnnotationsVFIODisk     = "cube.vfio.disk"
 	AnnotationsVFIODiskRM   = "cube.vfio.disk.rm"
