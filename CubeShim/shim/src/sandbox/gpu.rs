@@ -44,4 +44,30 @@ impl GpuIntegration {
     pub fn ivshmem_backing_file_path(&self, sandbox_id: u64) -> String {
         format!("/var/run/cube-gpu/shm/sandbox-{}.shm", sandbox_id)
     }
+
+    /// Ensure the IVSHMEM backing file exists on disk with the correct size.
+    ///
+    /// The VMM opens the backing path without O_CREAT, so the file must be
+    /// pre-created and sized before the VM is launched; otherwise boot fails
+    /// with `MemoryManager(SharedFileCreate(ENOENT))`.
+    pub fn ensure_backing_file(&self, sandbox_id: u64) -> std::io::Result<String> {
+        let path = self.ivshmem_backing_file_path(sandbox_id);
+        let p = std::path::Path::new(&path);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(p)?;
+        file.set_len(self.ivshmem_size_bytes())?;
+        Ok(path)
+    }
+
+    /// Remove the IVSHMEM backing file created by `ensure_backing_file`.
+    pub fn remove_backing_file(&self, sandbox_id: u64) {
+        let _ = std::fs::remove_file(self.ivshmem_backing_file_path(sandbox_id));
+    }
 }

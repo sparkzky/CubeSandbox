@@ -762,7 +762,11 @@ impl SandBox {
                 self.id.hash(&mut hasher);
                 hasher.finish()
             };
-            let shm_path = gpu_int.ivshmem_backing_file_path(sandbox_id_hash);
+            // The VMM opens the IVSHMEM backing path without O_CREAT, so the
+            // file (and its parent dir) must exist before VM launch.
+            let shm_path = gpu_int
+                .ensure_backing_file(sandbox_id_hash)
+                .map_err(|e| format!("failed to create ivshmem backing file: {}", e))?;
             vc.set_ivshmem(std::path::PathBuf::from(&shm_path), gpu_int.shm_size_mb as usize);
         }
 
@@ -770,6 +774,15 @@ impl SandBox {
     }
 
     pub async fn recycle_resource(&mut self) -> CResult<()> {
+        if let Some(gpu_int) = GpuIntegration::from_config(&self.conf.gpu) {
+            let sandbox_id_hash = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                self.id.hash(&mut hasher);
+                hasher.finish()
+            };
+            gpu_int.remove_backing_file(sandbox_id_hash);
+        }
         Ok(())
     }
 
