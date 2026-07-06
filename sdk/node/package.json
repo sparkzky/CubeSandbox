@@ -1,0 +1,59 @@
+{
+  "name": "@cubesandbox/sdk",
+  "version": "0.1.0",
+  "description": "Official Node.js / TypeScript SDK for CubeSandbox — E2B-compatible sandboxes.",
+  "license": "Apache-2.0",
+  "author": "CubeSandbox Contributors",
+  "homepage": "https://github.com/tencent/CubeSandbox/tree/main/sdk/node",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tencent/CubeSandbox.git",
+    "directory": "sdk/node"
+  },
+  "bugs": {
+    "url": "https://github.com/tencent/CubeSandbox/issues"
+  },
+  "keywords": [
+    "cubesandbox",
+    "sandbox",
+    "e2b",
+    "code-execution",
+    "sdk"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": {
+        "import": "./dist/index.d.ts",
+        "require": "./dist/index.d.cts"
+      },
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
