@@ -59,3 +59,8 @@ gpu/guest/src/libcube-gpu.so
 deploy/guest-image/libcube-gpu.so
 deploy/one-click/assets/kernel-artifacts/vmlinux
 deploy/guest-image/cuda_test
+
+# GPU build artifacts
+gpu/host/target/
+gpu/guest/src/*.o
+_output/
