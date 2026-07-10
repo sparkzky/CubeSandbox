@@ -57,6 +57,12 @@ async fn handle_connection(
             break;
         }
 
+        const MAX_PAYLOAD: usize = 16 * 1024 * 1024; // 16 MiB
+        if hdr.payload_len as usize > MAX_PAYLOAD {
+            let plen = hdr.payload_len;
+            warn!("Payload too large from CID {}: {} bytes", cid, plen);
+            break;
+        }
         let mut payload = vec![0u8; hdr.payload_len as usize];
         if hdr.payload_len > 0 {
             stream.read_exact(&mut payload).await?;

@@ -10,7 +10,7 @@ use crate::shm_manager::ShmManager;
 use crate::vsock_listener::{
     CUBE_GPU_RPC_MAGIC, CUBE_GPU_FLAG_RESPONSE, CUBE_GPU_API_SESSION_INIT,
     CUBE_GPU_API_MALLOC, CUBE_GPU_API_FREE, CUBE_GPU_API_MEMCPY,
-    CUBE_GPU_API_MODULE_LOAD, CUBE_GPU_API_MODULE_GET_FUNC,
+    CUBE_GPU_API_MODULE_LOAD, CUBE_GPU_API_MODULE_LOAD_DATA,
     CUBE_GPU_API_LAUNCH_KERNEL, CUBE_GPU_API_STREAM_CREATE,
     CUBE_GPU_API_STREAM_SYNC, CUBE_GPU_API_DEVICE_SYNC,
 };
@@ -26,6 +26,7 @@ pub struct Session {
     pub streams: HashMap<u64, u64>,
     pub shm_offset: u64,
     pub shm_size: u64,
+    pub shm_base: usize,
 }
 
 impl Session {
@@ -74,6 +75,7 @@ impl SessionManager {
             CUBE_GPU_API_STREAM_SYNC => self.handle_stream_sync(hdr, payload, session_handle),
             CUBE_GPU_API_DEVICE_SYNC => self.handle_device_sync(hdr, payload, session_handle),
             CUBE_GPU_API_MODULE_LOAD => self.handle_module_load(hdr, payload, session_handle),
+            CUBE_GPU_API_MODULE_LOAD_DATA => self.handle_module_load(hdr, payload, session_handle),
             CUBE_GPU_API_MODULE_GET_FUNC => self.handle_module_get_func(hdr, payload, session_handle),
             _ => self.make_error_response(hdr, 1),
         }
@@ -94,6 +96,16 @@ impl SessionManager {
         let shm_size = 64 * 1024 * 1024;
         let shm_offset = handle * shm_size;
 
+        /* Finding 1: create and mmap the IVSHMEM backing file for this session. */
+        let shm_path = match self.shm_mgr.create_shm_file(handle, shm_size) {
+            Some(p) => p,
+            None => return self.make_error_response(hdr, 1),
+        };
+        let shm_base = match self.shm_mgr.mmap_shm_file(&shm_path, shm_size) {
+            Some(ptr) => ptr as usize,
+            None => return self.make_error_response(hdr, 1),
+        };
+
         let session = Session {
             handle,
             sandbox_id,
@@ -105,6 +117,7 @@ impl SessionManager {
             streams: HashMap::new(),
             shm_offset,
             shm_size,
+            shm_base,
         };
 
         self.sessions.lock().unwrap().insert(handle, session);
@@ -152,6 +165,7 @@ impl SessionManager {
         match cuda.mem_alloc(size) {
             Ok(devptr) => {
                 session.memory_used += size;
+                session.allocations.insert(devptr, size);
                 let mut resp = Vec::with_capacity(12);
                 resp.extend_from_slice(&0u32.to_le_bytes());
                 resp.extend_from_slice(&devptr.to_le_bytes());
@@ -180,8 +194,23 @@ impl SessionManager {
         if payload.len() < 8 { return self.make_error_response(hdr, 1); }
         let vptr = u64::from_le_bytes(payload[0..8].try_into().unwrap());
 
-        let cuda = self.cuda.lock().unwrap();
-        let status = cuda.mem_free(vptr);
+        /* Finding 2: enforce ownership — only free allocations this session owns. */
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = match sessions.get_mut(&h) {
+            Some(s) => s,
+            None => return self.make_error_response(hdr, 1),
+        };
+
+        let (size, status) = match session.allocations.remove(&vptr) {
+            Some(sz) => {
+                session.memory_used = session.memory_used.saturating_sub(sz);
+                let cuda = self.cuda.lock().unwrap();
+                let st = cuda.mem_free(vptr);
+                (0u64, st)
+            }
+            None => (0u64, 1),
+        };
+        let _ = size;
 
         let mut resp = Vec::with_capacity(4);
         resp.extend_from_slice(&status.to_le_bytes());
@@ -194,12 +223,12 @@ impl SessionManager {
         payload: &[u8],
         session_handle: &mut Option<u64>,
     ) -> (crate::vsock_listener::RpcHeader, Vec<u8>) {
-        let _h = match session_handle {
+        let h = match session_handle {
             Some(h) => *h,
             None => return self.make_error_response(hdr, 1),
         };
 
-        if payload.len() < 40 { return self.make_error_response(hdr, 1); }
+        if payload.len() < 36 { return self.make_error_response(hdr, 1); }
 
         let kind = u32::from_le_bytes(payload[0..4].try_into().unwrap());
         let dst = u64::from_le_bytes(payload[4..12].try_into().unwrap());
@@ -208,22 +237,25 @@ impl SessionManager {
         let shm_offset = u64::from_le_bytes(payload[28..36].try_into().unwrap());
 
         let has_shm = (hdr.flags & 0x01) != 0;
-        let cuda = self.cuda.lock().unwrap();
 
+        /* Finding 1/D: read per-session shm region for bounds-checked access. */
+        let (shm_base, shm_size) = {
+            let sessions = self.sessions.lock().unwrap();
+            match sessions.get(&h) {
+                Some(s) => (s.shm_base as *mut u8, s.shm_size as usize),
+                None => return self.make_error_response(hdr, 1),
+            }
+        };
+
+        let cuda = self.cuda.lock().unwrap();
         let status = match kind {
             1 => {
-                if has_shm {
-                    cuda.memcpy_h2d_via_shm(dst, shm_offset, size)
-                } else {
-                    cuda.memcpy_h2d(dst, src, size)
-                }
+                let off = if has_shm { shm_offset } else { src };
+                cuda.memcpy_h2d(dst, off, size, shm_base, shm_size)
             }
             2 => {
-                let status = cuda.memcpy_d2h(dst, src, size);
-                if has_shm && status == 0 {
-                    // Host wrote result to SHM — nothing more to do here
-                }
-                status
+                let off = if has_shm { shm_offset } else { dst };
+                cuda.memcpy_d2h(off, src, size, shm_base, shm_size)
             }
             3 => cuda.memcpy_d2d(dst, src, size),
             _ => 1,
@@ -240,7 +272,7 @@ impl SessionManager {
         payload: &[u8],
         session_handle: &mut Option<u64>,
     ) -> (crate::vsock_listener::RpcHeader, Vec<u8>) {
-        let _h = match session_handle {
+        let h = match session_handle {
             Some(h) => *h,
             None => return self.make_error_response(hdr, 1),
         };
@@ -255,15 +287,24 @@ impl SessionManager {
         let block_y = u32::from_le_bytes(payload[24..28].try_into().unwrap());
         let block_z = u32::from_le_bytes(payload[28..32].try_into().unwrap());
         let shared_mem = u32::from_le_bytes(payload[32..36].try_into().unwrap());
-        let _stream = u64::from_le_bytes(payload[36..44].try_into().unwrap());
+        let stream = u64::from_le_bytes(payload[36..44].try_into().unwrap());
         let params_offset = u64::from_le_bytes(payload[44..52].try_into().unwrap());
         let params_size = u64::from_le_bytes(payload[52..60].try_into().unwrap());
+
+        let (shm_base, shm_size) = {
+            let sessions = self.sessions.lock().unwrap();
+            match sessions.get(&h) {
+                Some(s) => (s.shm_base as *mut u8, s.shm_size as usize),
+                None => return self.make_error_response(hdr, 1),
+            }
+        };
 
         let cuda = self.cuda.lock().unwrap();
         let status = cuda.launch_kernel(
             func_handle, grid_x, grid_y, grid_z,
             block_x, block_y, block_z, shared_mem,
-            params_offset, params_size,
+            stream, params_offset, params_size,
+            shm_base, shm_size,
         );
 
         let mut resp = Vec::with_capacity(4);
@@ -341,17 +382,25 @@ impl SessionManager {
         payload: &[u8],
         session_handle: &mut Option<u64>,
     ) -> (crate::vsock_listener::RpcHeader, Vec<u8>) {
-        let _h = match session_handle {
+        let h = match session_handle {
             Some(h) => *h,
             None => return self.make_error_response(hdr, 1),
         };
 
         if payload.len() < 16 { return self.make_error_response(hdr, 1); }
-        let _image_size = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-        let _shm_offset = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+        let image_size = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let shm_offset = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+
+        let (shm_base, shm_size) = {
+            let sessions = self.sessions.lock().unwrap();
+            match sessions.get(&h) {
+                Some(s) => (s.shm_base as *mut u8, s.shm_size as usize),
+                None => return self.make_error_response(hdr, 1),
+            }
+        };
 
         let cuda = self.cuda.lock().unwrap();
-        match cuda.module_load_from_shm(_shm_offset, _image_size) {
+        match cuda.module_load_from_shm(shm_offset, image_size, shm_base, shm_size) {
             Ok(module) => {
                 let mut resp = Vec::with_capacity(12);
                 resp.extend_from_slice(&0u32.to_le_bytes());

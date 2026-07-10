@@ -202,13 +202,13 @@ static void initialize(void) {
 
 /* ─── RPC helper ──────────────────────────────────────── */
 
-static int rpc_call(cube_gpu_api_id_t api, const void *req, size_t req_len,
+static int rpc_call(cube_gpu_api_id_t api, uint32_t flags, const void *req, size_t req_len,
                     cube_gpu_rpc_header_t *resp_hdr, void *resp, size_t resp_cap) {
     if (!g_rpc.initialized) return -1;
 
     cube_gpu_rpc_header_t hdr;
     cube_gpu_init_header(&hdr, api, g_rpc.next_request_id++,
-                         g_rpc.session_id, (uint32_t)req_len, CUBE_GPU_FLAG_NONE);
+                         g_rpc.session_id, (uint32_t)req_len, flags);
 
     if (cube_gpu_rpc_send(&g_rpc, &hdr, req) < 0) {
         log_err("rpc_send failed for api=%d", api);
@@ -247,7 +247,7 @@ CUresult cuMemAlloc(CUdeviceptr *dptr, size_t bytesize) {
     cube_gpu_rpc_header_t resp_hdr;
     cube_gpu_malloc_resp_t resp = {0};
 
-    if (rpc_call(CUBE_GPU_API_MALLOC, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
+    if (rpc_call(CUBE_GPU_API_MALLOC, CUBE_GPU_FLAG_NONE, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
         return CUDA_ERROR_OUT_OF_MEMORY;
 
     if (resp.status == CUDA_SUCCESS && resp.vptr != 0) {
@@ -271,7 +271,7 @@ CUresult cuMemFree(CUdeviceptr dptr) {
     cube_gpu_free_resp_t resp = {0};
 
     CUresult ret = CUDA_SUCCESS;
-    if (rpc_call(CUBE_GPU_API_FREE, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
+    if (rpc_call(CUBE_GPU_API_FREE, CUBE_GPU_FLAG_NONE, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
         ret = CUDA_ERROR_LAUNCH_FAILED;
     else ret = (CUresult)resp.status;
 
@@ -307,7 +307,7 @@ CUresult cuMemcpyHtoD(CUdeviceptr dstDevice, const void *srcHost, size_t ByteCou
     cube_gpu_rpc_header_t resp_hdr;
     cube_gpu_memcpy_resp_t resp = {0};
 
-    if (rpc_call(CUBE_GPU_API_MEMCPY, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
+    if (rpc_call(CUBE_GPU_API_MEMCPY, flags, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
         return CUDA_ERROR_LAUNCH_FAILED;
     return (CUresult)resp.status;
 }
@@ -318,6 +318,7 @@ CUresult cuMemcpyDtoH(void *dstHost, CUdeviceptr srcDevice, size_t ByteCount) {
     uint64_t host_src = find_host_handle((uint64_t)srcDevice);
     if (host_src == 0) return CUDA_ERROR_INVALID_VALUE;
 
+    uint32_t flags = CUBE_GPU_FLAG_NONE;
     cube_gpu_memcpy_req_t req = {
         .kind = CUBE_GPU_MEMCPY_DEVICE_TO_HOST,
         .dst = 0,
@@ -325,13 +326,15 @@ CUresult cuMemcpyDtoH(void *dstHost, CUdeviceptr srcDevice, size_t ByteCount) {
         .size = ByteCount,
         .shm_offset = 0
     };
-    if (ByteCount > CUBE_GPU_SHM_THRESHOLD && g_shm.base)
+    if (ByteCount > CUBE_GPU_SHM_THRESHOLD && g_shm.base) {
+        flags = CUBE_GPU_FLAG_SHM_DATA;
         req.shm_offset = 0;
+    }
 
     cube_gpu_rpc_header_t resp_hdr;
     cube_gpu_memcpy_resp_t resp = {0};
 
-    if (rpc_call(CUBE_GPU_API_MEMCPY, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
+    if (rpc_call(CUBE_GPU_API_MEMCPY, flags, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
         return CUDA_ERROR_LAUNCH_FAILED;
 
     if (resp.status == CUDA_SUCCESS && ByteCount > 0 && g_shm.base) {
@@ -395,7 +398,7 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
     cube_gpu_rpc_header_t resp_hdr;
     cube_gpu_launch_kernel_resp_t resp = {0};
 
-    if (rpc_call(CUBE_GPU_API_LAUNCH_KERNEL, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
+    if (rpc_call(CUBE_GPU_API_LAUNCH_KERNEL, CUBE_GPU_FLAG_NONE, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
         return CUDA_ERROR_LAUNCH_FAILED;
     return (CUresult)resp.status;
 }
@@ -408,7 +411,7 @@ CUresult cuStreamCreate(CUstream *phStream, unsigned int Flags) {
     cube_gpu_rpc_header_t resp_hdr;
     cube_gpu_stream_create_resp_t resp = {0};
 
-    if (rpc_call(CUBE_GPU_API_STREAM_CREATE, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
+    if (rpc_call(CUBE_GPU_API_STREAM_CREATE, CUBE_GPU_FLAG_NONE, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
         return CUDA_ERROR_LAUNCH_FAILED;
 
     if (resp.status == CUDA_SUCCESS && resp.stream_vptr != 0) {
@@ -428,7 +431,7 @@ CUresult cuStreamSynchronize(CUstream hStream) {
     cube_gpu_rpc_header_t resp_hdr;
     cube_gpu_stream_sync_resp_t resp = {0};
 
-    if (rpc_call(CUBE_GPU_API_STREAM_SYNC, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
+    if (rpc_call(CUBE_GPU_API_STREAM_SYNC, CUBE_GPU_FLAG_NONE, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
         return CUDA_ERROR_LAUNCH_FAILED;
     return (CUresult)resp.status;
 }
@@ -439,7 +442,7 @@ CUresult cuCtxSynchronize(void) {
     cube_gpu_rpc_header_t resp_hdr;
     cube_gpu_device_sync_resp_t resp = {0};
 
-    if (rpc_call(CUBE_GPU_API_DEVICE_SYNC, NULL, 0, &resp_hdr, &resp, sizeof(resp)) < 0)
+    if (rpc_call(CUBE_GPU_API_DEVICE_SYNC, CUBE_GPU_FLAG_NONE, NULL, 0, &resp_hdr, &resp, sizeof(resp)) < 0)
         return CUDA_ERROR_LAUNCH_FAILED;
     return (CUresult)resp.status;
 }
@@ -469,7 +472,7 @@ CUresult cuModuleLoadData(CUmodule *module, const void *image) {
     cube_gpu_rpc_header_t resp_hdr;
     cube_gpu_module_load_data_resp_t resp = {0};
 
-    if (rpc_call(CUBE_GPU_API_MODULE_LOAD_DATA, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
+    if (rpc_call(CUBE_GPU_API_MODULE_LOAD_DATA, CUBE_GPU_FLAG_NONE, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
         return CUDA_ERROR_LAUNCH_FAILED;
 
     if (resp.status == CUDA_SUCCESS && resp.module_handle != 0) {
@@ -495,7 +498,7 @@ CUresult cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name)
     cube_gpu_rpc_header_t resp_hdr;
     cube_gpu_module_get_func_resp_t resp = {0};
 
-    if (rpc_call(CUBE_GPU_API_MODULE_GET_FUNC, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
+    if (rpc_call(CUBE_GPU_API_MODULE_GET_FUNC, CUBE_GPU_FLAG_NONE, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
         return CUDA_ERROR_LAUNCH_FAILED;
 
     if (resp.status == CUDA_SUCCESS && resp.func_handle != 0) {

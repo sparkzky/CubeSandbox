@@ -70,10 +70,10 @@ size_t cube_gpu_shm_ring_write(cube_gpu_shm_ring_t *ring, const void *data, size
     uint64_t w = atomic_load((_Atomic uint64_t *)&ring->header->write_pos);
     uint64_t mask = ring->data_size - 1;
 
-    size_t first_chunk = ring->data_size - (w & mask);
+    size_t first_chunk = ring->data_size - (w % ring->data_size);
     if (first_chunk > to_write) first_chunk = to_write;
 
-    memcpy(ring->data + (w & mask), data, first_chunk);
+    memcpy(ring->data + (w % ring->data_size), data, first_chunk);
     if (to_write > first_chunk) {
         memcpy(ring->data, (const uint8_t *)data + first_chunk, to_write - first_chunk);
     }
@@ -90,12 +90,11 @@ size_t cube_gpu_shm_ring_read(cube_gpu_shm_ring_t *ring, void *buf, size_t len) 
     size_t to_read = len < avail ? len : avail;
 
     uint64_t r = atomic_load((_Atomic uint64_t *)&ring->header->read_pos);
-    uint64_t mask = ring->data_size - 1;
 
-    size_t first_chunk = ring->data_size - (r & mask);
+    size_t first_chunk = ring->data_size - (r % ring->data_size);
     if (first_chunk > to_read) first_chunk = to_read;
 
-    memcpy(buf, ring->data + (r & mask), first_chunk);
+    memcpy(buf, ring->data + (r % ring->data_size), first_chunk);
     if (to_read > first_chunk) {
         memcpy((uint8_t *)buf + first_chunk, ring->data, to_read - first_chunk);
     }
