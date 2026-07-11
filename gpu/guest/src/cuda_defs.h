@@ -93,6 +93,7 @@ typedef CUresult (*cuGetProcAddress_v2_func)(const char *, void **, int, uint64_
 #define cuModuleLoadDataEx   cuModuleLoadDataEx_v2
 #define cuModuleGetFunction  cuModuleGetFunction_v2
 #define cuStreamDestroy      cuStreamDestroy_v2
+#define cuCtxCreate         cuCtxCreate_v2
 #define cuCtxDestroy         cuCtxDestroy_v2
 #define cuCtxSetCurrent      cuCtxSetCurrent_v2
 #define cuCtxGetCurrent      cuCtxGetCurrent_v2

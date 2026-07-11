@@ -1,8 +1,9 @@
 // Copyright (c) 2024 Tencent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use tracing::{info, error};
 
 use crate::cuda_runtime::CudaRuntime;
@@ -11,8 +12,11 @@ use crate::vsock_listener::{
     CUBE_GPU_RPC_MAGIC, CUBE_GPU_FLAG_RESPONSE, CUBE_GPU_API_SESSION_INIT,
     CUBE_GPU_API_MALLOC, CUBE_GPU_API_FREE, CUBE_GPU_API_MEMCPY,
     CUBE_GPU_API_MODULE_LOAD, CUBE_GPU_API_MODULE_LOAD_DATA,
+    CUBE_GPU_API_MODULE_GET_FUNC,
     CUBE_GPU_API_LAUNCH_KERNEL, CUBE_GPU_API_STREAM_CREATE,
     CUBE_GPU_API_STREAM_SYNC, CUBE_GPU_API_DEVICE_SYNC,
+    CUBE_GPU_API_CTX_CREATE, CUBE_GPU_API_CTX_DESTROY,
+    CUBE_GPU_API_CTX_SET_CURRENT, CUBE_GPU_API_CTX_GET_CURRENT,
 };
 
 pub struct Session {
@@ -24,6 +28,8 @@ pub struct Session {
     pub modules: HashMap<u64, u64>,
     pub functions: HashMap<u64, (String, u64)>,
     pub streams: HashMap<u64, u64>,
+    pub context: u64,
+    pub contexts: HashSet<u64>,
     pub shm_offset: u64,
     pub shm_size: u64,
     pub shm_base: usize,
@@ -53,7 +59,7 @@ impl SessionManager {
     }
 
     fn alloc_handle(&self) -> u64 {
-        let mut h = self.next_handle.lock().unwrap();
+        let mut h = self.next_handle.lock();
         let v = *h;
         *h += 1;
         v
@@ -77,6 +83,10 @@ impl SessionManager {
             CUBE_GPU_API_MODULE_LOAD => self.handle_module_load(hdr, payload, session_handle),
             CUBE_GPU_API_MODULE_LOAD_DATA => self.handle_module_load(hdr, payload, session_handle),
             CUBE_GPU_API_MODULE_GET_FUNC => self.handle_module_get_func(hdr, payload, session_handle),
+            CUBE_GPU_API_CTX_CREATE => self.handle_ctx_create(hdr, payload, session_handle),
+            CUBE_GPU_API_CTX_DESTROY => self.handle_ctx_destroy(hdr, payload, session_handle),
+            CUBE_GPU_API_CTX_SET_CURRENT => self.handle_ctx_set_current(hdr, payload, session_handle),
+            CUBE_GPU_API_CTX_GET_CURRENT => self.handle_ctx_get_current(hdr, payload, session_handle),
             _ => self.make_error_response(hdr, 1),
         }
     }
@@ -115,12 +125,14 @@ impl SessionManager {
             modules: HashMap::new(),
             functions: HashMap::new(),
             streams: HashMap::new(),
+            context: 0,
+            contexts: HashSet::new(),
             shm_offset,
             shm_size,
             shm_base,
         };
 
-        self.sessions.lock().unwrap().insert(handle, session);
+        self.sessions.lock().insert(handle, session);
         *session_handle = Some(handle);
 
         info!("Session init: handle={} sandbox={} quota={}", handle, sandbox_id, memory_quota);
@@ -148,7 +160,7 @@ impl SessionManager {
         if payload.len() < 8 { return self.make_error_response(hdr, 1); }
         let size = u64::from_le_bytes(payload[0..8].try_into().unwrap());
 
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock();
         let session = match sessions.get_mut(&h) {
             Some(s) => s,
             None => return self.make_error_response(hdr, 1),
@@ -161,7 +173,10 @@ impl SessionManager {
             return (self.make_response_hdr(hdr, resp.len() as u32, 2), resp);
         }
 
-        let cuda = self.cuda.lock().unwrap();
+        let cuda = self.cuda.lock();
+        if session.context != 0 {
+            cuda.ctx_set_current(session.context);
+        }
         match cuda.mem_alloc(size) {
             Ok(devptr) => {
                 session.memory_used += size;
@@ -195,7 +210,7 @@ impl SessionManager {
         let vptr = u64::from_le_bytes(payload[0..8].try_into().unwrap());
 
         /* Finding 2: enforce ownership — only free allocations this session owns. */
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock();
         let session = match sessions.get_mut(&h) {
             Some(s) => s,
             None => return self.make_error_response(hdr, 1),
@@ -204,7 +219,10 @@ impl SessionManager {
         let (size, status) = match session.allocations.remove(&vptr) {
             Some(sz) => {
                 session.memory_used = session.memory_used.saturating_sub(sz);
-                let cuda = self.cuda.lock().unwrap();
+                let cuda = self.cuda.lock();
+                if session.context != 0 {
+                    cuda.ctx_set_current(session.context);
+                }
                 let st = cuda.mem_free(vptr);
                 (0u64, st)
             }
@@ -239,15 +257,18 @@ impl SessionManager {
         let has_shm = (hdr.flags & 0x01) != 0;
 
         /* Finding 1/D: read per-session shm region for bounds-checked access. */
-        let (shm_base, shm_size) = {
-            let sessions = self.sessions.lock().unwrap();
+        let (shm_base, shm_size, ctx) = {
+            let sessions = self.sessions.lock();
             match sessions.get(&h) {
-                Some(s) => (s.shm_base as *mut u8, s.shm_size as usize),
+                Some(s) => (s.shm_base as *mut u8, s.shm_size as usize, s.context),
                 None => return self.make_error_response(hdr, 1),
             }
         };
 
-        let cuda = self.cuda.lock().unwrap();
+        let cuda = self.cuda.lock();
+        if ctx != 0 {
+            cuda.ctx_set_current(ctx);
+        }
         let status = match kind {
             1 => {
                 let off = if has_shm { shm_offset } else { src };
@@ -291,15 +312,18 @@ impl SessionManager {
         let params_offset = u64::from_le_bytes(payload[44..52].try_into().unwrap());
         let params_size = u64::from_le_bytes(payload[52..60].try_into().unwrap());
 
-        let (shm_base, shm_size) = {
-            let sessions = self.sessions.lock().unwrap();
+        let (shm_base, shm_size, ctx) = {
+            let sessions = self.sessions.lock();
             match sessions.get(&h) {
-                Some(s) => (s.shm_base as *mut u8, s.shm_size as usize),
+                Some(s) => (s.shm_base as *mut u8, s.shm_size as usize, s.context),
                 None => return self.make_error_response(hdr, 1),
             }
         };
 
-        let cuda = self.cuda.lock().unwrap();
+        let cuda = self.cuda.lock();
+        if ctx != 0 {
+            cuda.ctx_set_current(ctx);
+        }
         let status = cuda.launch_kernel(
             func_handle, grid_x, grid_y, grid_z,
             block_x, block_y, block_z, shared_mem,
@@ -318,12 +342,23 @@ impl SessionManager {
         _payload: &[u8],
         session_handle: &mut Option<u64>,
     ) -> (crate::vsock_listener::RpcHeader, Vec<u8>) {
-        let _h = match session_handle {
+        let h = match session_handle {
             Some(h) => *h,
             None => return self.make_error_response(hdr, 1),
         };
 
-        let cuda = self.cuda.lock().unwrap();
+        let ctx = {
+            let sessions = self.sessions.lock();
+            match sessions.get(&h) {
+                Some(s) => s.context,
+                None => return self.make_error_response(hdr, 1),
+            }
+        };
+
+        let cuda = self.cuda.lock();
+        if ctx != 0 {
+            cuda.ctx_set_current(ctx);
+        }
         match cuda.stream_create() {
             Ok(stream_ptr) => {
                 let mut resp = Vec::with_capacity(12);
@@ -346,7 +381,7 @@ impl SessionManager {
         payload: &[u8],
         session_handle: &mut Option<u64>,
     ) -> (crate::vsock_listener::RpcHeader, Vec<u8>) {
-        let _h = match session_handle {
+        let h = match session_handle {
             Some(h) => *h,
             None => return self.make_error_response(hdr, 1),
         };
@@ -354,7 +389,18 @@ impl SessionManager {
         if payload.len() < 8 { return self.make_error_response(hdr, 1); }
         let stream = u64::from_le_bytes(payload[0..8].try_into().unwrap());
 
-        let cuda = self.cuda.lock().unwrap();
+        let ctx = {
+            let sessions = self.sessions.lock();
+            match sessions.get(&h) {
+                Some(s) => s.context,
+                None => return self.make_error_response(hdr, 1),
+            }
+        };
+
+        let cuda = self.cuda.lock();
+        if ctx != 0 {
+            cuda.ctx_set_current(ctx);
+        }
         let status = cuda.stream_synchronize(stream);
 
         let mut resp = Vec::with_capacity(4);
@@ -366,9 +412,25 @@ impl SessionManager {
         &self,
         hdr: &crate::vsock_listener::RpcHeader,
         _payload: &[u8],
-        _session_handle: &mut Option<u64>,
+        session_handle: &mut Option<u64>,
     ) -> (crate::vsock_listener::RpcHeader, Vec<u8>) {
-        let cuda = self.cuda.lock().unwrap();
+        let h = match session_handle {
+            Some(h) => *h,
+            None => return self.make_error_response(hdr, 1),
+        };
+
+        let ctx = {
+            let sessions = self.sessions.lock();
+            match sessions.get(&h) {
+                Some(s) => s.context,
+                None => return self.make_error_response(hdr, 1),
+            }
+        };
+
+        let cuda = self.cuda.lock();
+        if ctx != 0 {
+            cuda.ctx_set_current(ctx);
+        }
         let status = cuda.device_synchronize();
 
         let mut resp = Vec::with_capacity(4);
@@ -391,15 +453,18 @@ impl SessionManager {
         let image_size = u64::from_le_bytes(payload[0..8].try_into().unwrap());
         let shm_offset = u64::from_le_bytes(payload[8..16].try_into().unwrap());
 
-        let (shm_base, shm_size) = {
-            let sessions = self.sessions.lock().unwrap();
+        let (shm_base, shm_size, ctx) = {
+            let sessions = self.sessions.lock();
             match sessions.get(&h) {
-                Some(s) => (s.shm_base as *mut u8, s.shm_size as usize),
+                Some(s) => (s.shm_base as *mut u8, s.shm_size as usize, s.context),
                 None => return self.make_error_response(hdr, 1),
             }
         };
 
-        let cuda = self.cuda.lock().unwrap();
+        let cuda = self.cuda.lock();
+        if ctx != 0 {
+            cuda.ctx_set_current(ctx);
+        }
         match cuda.module_load_from_shm(shm_offset, image_size, shm_base, shm_size) {
             Ok(module) => {
                 let mut resp = Vec::with_capacity(12);
@@ -422,7 +487,7 @@ impl SessionManager {
         payload: &[u8],
         session_handle: &mut Option<u64>,
     ) -> (crate::vsock_listener::RpcHeader, Vec<u8>) {
-        let _h = match session_handle {
+        let h = match session_handle {
             Some(h) => *h,
             None => return self.make_error_response(hdr, 1),
         };
@@ -434,7 +499,18 @@ impl SessionManager {
             .trim_end_matches('\0')
             .to_string();
 
-        let cuda = self.cuda.lock().unwrap();
+        let ctx = {
+            let sessions = self.sessions.lock();
+            match sessions.get(&h) {
+                Some(s) => s.context,
+                None => return self.make_error_response(hdr, 1),
+            }
+        };
+
+        let cuda = self.cuda.lock();
+        if ctx != 0 {
+            cuda.ctx_set_current(ctx);
+        }
         match cuda.module_get_function(_module, &name) {
             Ok(func) => {
                 let mut resp = Vec::with_capacity(12);
@@ -451,10 +527,137 @@ impl SessionManager {
         }
     }
 
+    fn handle_ctx_create(
+        &self,
+        hdr: &crate::vsock_listener::RpcHeader,
+        payload: &[u8],
+        session_handle: &mut Option<u64>,
+    ) -> (crate::vsock_listener::RpcHeader, Vec<u8>) {
+        let h = match session_handle {
+            Some(h) => *h,
+            None => return self.make_error_response(hdr, 1),
+        };
+
+        if payload.len() < 8 { return self.make_error_response(hdr, 1); }
+        let flags = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+        let device_id = i32::from_le_bytes(payload[4..8].try_into().unwrap());
+
+        let mut sessions = self.sessions.lock();
+        let session = match sessions.get_mut(&h) {
+            Some(s) => s,
+            None => return self.make_error_response(hdr, 1),
+        };
+
+        let cuda = self.cuda.lock();
+        match cuda.ctx_create(flags, device_id) {
+            Ok(ctx) => {
+                session.contexts.insert(ctx);
+                session.context = ctx;
+                let mut resp = Vec::with_capacity(12);
+                resp.extend_from_slice(&0u32.to_le_bytes());
+                resp.extend_from_slice(&ctx.to_le_bytes());
+                (self.make_response_hdr(hdr, resp.len() as u32, 0), resp)
+            }
+            Err(status) => {
+                let mut resp = Vec::with_capacity(12);
+                resp.extend_from_slice(&status.to_le_bytes());
+                resp.extend_from_slice(&0u64.to_le_bytes());
+                (self.make_response_hdr(hdr, resp.len() as u32, status), resp)
+            }
+        }
+    }
+
+    fn handle_ctx_destroy(
+        &self,
+        hdr: &crate::vsock_listener::RpcHeader,
+        payload: &[u8],
+        session_handle: &mut Option<u64>,
+    ) -> (crate::vsock_listener::RpcHeader, Vec<u8>) {
+        let h = match session_handle {
+            Some(h) => *h,
+            None => return self.make_error_response(hdr, 1),
+        };
+
+        if payload.len() < 8 { return self.make_error_response(hdr, 1); }
+        let ctx_handle = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+
+        let mut sessions = self.sessions.lock();
+        let session = match sessions.get_mut(&h) {
+            Some(s) => s,
+            None => return self.make_error_response(hdr, 1),
+        };
+
+        session.contexts.remove(&ctx_handle);
+        if session.context == ctx_handle {
+            session.context = 0;
+        }
+
+        let cuda = self.cuda.lock();
+        if session.context != 0 {
+            cuda.ctx_set_current(session.context);
+        }
+        let status = cuda.ctx_destroy(ctx_handle);
+
+        let mut resp = Vec::with_capacity(4);
+        resp.extend_from_slice(&status.to_le_bytes());
+        (self.make_response_hdr(hdr, resp.len() as u32, status), resp)
+    }
+
+    fn handle_ctx_set_current(
+        &self,
+        hdr: &crate::vsock_listener::RpcHeader,
+        payload: &[u8],
+        session_handle: &mut Option<u64>,
+    ) -> (crate::vsock_listener::RpcHeader, Vec<u8>) {
+        let h = match session_handle {
+            Some(h) => *h,
+            None => return self.make_error_response(hdr, 1),
+        };
+
+        if payload.len() < 8 { return self.make_error_response(hdr, 1); }
+        let ctx_handle = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+
+        let mut sessions = self.sessions.lock();
+        let session = match sessions.get_mut(&h) {
+            Some(s) => s,
+            None => return self.make_error_response(hdr, 1),
+        };
+
+        session.context = ctx_handle;
+
+        let mut resp = Vec::with_capacity(4);
+        resp.extend_from_slice(&0u32.to_le_bytes());
+        (self.make_response_hdr(hdr, resp.len() as u32, 0), resp)
+    }
+
+    fn handle_ctx_get_current(
+        &self,
+        hdr: &crate::vsock_listener::RpcHeader,
+        _payload: &[u8],
+        session_handle: &mut Option<u64>,
+    ) -> (crate::vsock_listener::RpcHeader, Vec<u8>) {
+        let h = match session_handle {
+            Some(h) => *h,
+            None => return self.make_error_response(hdr, 1),
+        };
+
+        let sessions = self.sessions.lock();
+        let session = match sessions.get(&h) {
+            Some(s) => s,
+            None => return self.make_error_response(hdr, 1),
+        };
+        let ctx = session.context;
+
+        let mut resp = Vec::with_capacity(12);
+        resp.extend_from_slice(&0u32.to_le_bytes());
+        resp.extend_from_slice(&ctx.to_le_bytes());
+        (self.make_response_hdr(hdr, resp.len() as u32, 0), resp)
+    }
+
     pub fn destroy_session(&self, handle: u64) {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock();
         if let Some(mut session) = sessions.remove(&handle) {
-            let cuda = self.cuda.lock().unwrap();
+            let cuda = self.cuda.lock();
             for (_, ptr) in session.allocations.drain() {
                 let _ = cuda.mem_free(ptr);
             }
@@ -463,6 +666,9 @@ impl SessionManager {
             }
             for (_, ptr) in session.streams.drain() {
                 let _ = cuda.stream_destroy(ptr);
+            }
+            for ctx in session.contexts.drain() {
+                let _ = cuda.ctx_destroy(ctx);
             }
             info!("Session {} destroyed, freed {} bytes", handle, session.memory_used);
         }

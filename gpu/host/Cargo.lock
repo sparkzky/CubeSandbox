@@ -55,6 +55,7 @@ dependencies = [
  "libc",
  "libloading",
  "nix 0.27.1",
+ "parking_lot",
  "serde",
  "serde_json",
  "thiserror",

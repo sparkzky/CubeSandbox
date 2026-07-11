@@ -295,6 +295,31 @@ typedef struct __attribute__((__packed__)) cube_gpu_mem_get_info_resp {
     uint64_t total_memory;    /* Total quota */
 } cube_gpu_mem_get_info_resp_t;
 
+/* ── Context management ── */
+
+typedef struct __attribute__((packed)) cube_gpu_ctx_create_req {
+    uint32_t flags;       /* CU_CTX_* flags */
+    uint32_t device_id;   /* Device index */
+} cube_gpu_ctx_create_req_t;
+
+typedef struct __attribute__((packed)) cube_gpu_ctx_create_resp {
+    int32_t  status;
+    uint64_t ctx_handle;  /* Host CUcontext handle */
+} cube_gpu_ctx_create_resp_t;
+
+typedef struct __attribute__((packed)) cube_gpu_ctx_op_req {
+    uint64_t ctx_handle;  /* Context to destroy / set current */
+} cube_gpu_ctx_op_req_t;
+
+typedef struct __attribute__((packed)) cube_gpu_ctx_op_resp {
+    int32_t status;
+} cube_gpu_ctx_op_resp_t;
+
+typedef struct __attribute__((packed)) cube_gpu_ctx_get_resp {
+    int32_t  status;
+    uint64_t ctx_handle;  /* Current context for this session */
+} cube_gpu_ctx_get_resp_t;
+
 /* ─── Helper: compute total message size ────────────────────────── */
 
 static inline size_t cube_gpu_msg_total_size(const cube_gpu_rpc_header_t *hdr) {

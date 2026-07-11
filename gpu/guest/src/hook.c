@@ -508,6 +508,68 @@ CUresult cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name)
     }
     return (CUresult)resp.status;
 }
+/* ─── Context management ──────────────────────────────── */
+
+CUresult cuCtxCreate(CUcontext *pctx, unsigned int flags, CUdevice dev) {
+    pthread_once(&init_done, initialize);
+    if (!g_rpc.initialized) return CUDA_ERROR_NOT_INITIALIZED;
+    if (!pctx) return CUDA_ERROR_INVALID_VALUE;
+
+    cube_gpu_ctx_create_req_t req = {.flags = flags, .device_id = (uint32_t)dev};
+    cube_gpu_rpc_header_t resp_hdr;
+    cube_gpu_ctx_create_resp_t resp = {0};
+
+    if (rpc_call(CUBE_GPU_API_CTX_CREATE, CUBE_GPU_FLAG_NONE, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
+        return CUDA_ERROR_LAUNCH_FAILED;
+
+    if (resp.status == CUDA_SUCCESS && resp.ctx_handle != 0) {
+        *pctx = (CUcontext)(uintptr_t)resp.ctx_handle;
+    }
+    return (CUresult)resp.status;
+}
+
+CUresult cuCtxDestroy(CUcontext ctx) {
+    if (!g_rpc.initialized) return CUDA_ERROR_NOT_INITIALIZED;
+    if (!ctx) return CUDA_SUCCESS;
+
+    cube_gpu_ctx_op_req_t req = {.ctx_handle = (uint64_t)(uintptr_t)ctx};
+    cube_gpu_rpc_header_t resp_hdr;
+    cube_gpu_ctx_op_resp_t resp = {0};
+
+    if (rpc_call(CUBE_GPU_API_CTX_DESTROY, CUBE_GPU_FLAG_NONE, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
+        return CUDA_ERROR_LAUNCH_FAILED;
+    return (CUresult)resp.status;
+}
+
+CUresult cuCtxSetCurrent(CUcontext ctx) {
+    if (!g_rpc.initialized) return CUDA_ERROR_NOT_INITIALIZED;
+
+    cube_gpu_ctx_op_req_t req = {.ctx_handle = ctx ? (uint64_t)(uintptr_t)ctx : 0};
+    cube_gpu_rpc_header_t resp_hdr;
+    cube_gpu_ctx_op_resp_t resp = {0};
+
+    if (rpc_call(CUBE_GPU_API_CTX_SET_CURRENT, CUBE_GPU_FLAG_NONE, &req, sizeof(req), &resp_hdr, &resp, sizeof(resp)) < 0)
+        return CUDA_ERROR_LAUNCH_FAILED;
+    return (CUresult)resp.status;
+}
+
+CUresult cuCtxGetCurrent(CUcontext *pctx) {
+    pthread_once(&init_done, initialize);
+    if (!g_rpc.initialized) return CUDA_ERROR_NOT_INITIALIZED;
+    if (!pctx) return CUDA_ERROR_INVALID_VALUE;
+
+    cube_gpu_rpc_header_t resp_hdr;
+    cube_gpu_ctx_get_resp_t resp = {0};
+
+    if (rpc_call(CUBE_GPU_API_CTX_GET_CURRENT, CUBE_GPU_FLAG_NONE, NULL, 0, &resp_hdr, &resp, sizeof(resp)) < 0)
+        return CUDA_ERROR_LAUNCH_FAILED;
+
+    if (resp.status == CUDA_SUCCESS) {
+        *pctx = (CUcontext)(uintptr_t)resp.ctx_handle;
+    }
+    return (CUresult)resp.status;
+}
+
 
 /* ─── dlsym hook (glibc 2.2.5) ────────────────────────── */
 
@@ -528,6 +590,10 @@ void *dlsym_225(void *handle, const char *symbol) {
     if (strcmp(symbol, CUDA_SYMBOL_STRING(cuCtxSynchronize)) == 0)       return (void *)&cuCtxSynchronize;
     if (strcmp(symbol, CUDA_SYMBOL_STRING(cuModuleLoadData)) == 0)       return (void *)&cuModuleLoadData;
     if (strcmp(symbol, CUDA_SYMBOL_STRING(cuModuleGetFunction)) == 0)    return (void *)&cuModuleGetFunction;
+    if (strcmp(symbol, CUDA_SYMBOL_STRING(cuCtxCreate)) == 0)          return (void *)&cuCtxCreate;
+    if (strcmp(symbol, CUDA_SYMBOL_STRING(cuCtxDestroy)) == 0)         return (void *)&cuCtxDestroy;
+    if (strcmp(symbol, CUDA_SYMBOL_STRING(cuCtxSetCurrent)) == 0)      return (void *)&cuCtxSetCurrent;
+    if (strcmp(symbol, CUDA_SYMBOL_STRING(cuCtxGetCurrent)) == 0)      return (void *)&cuCtxGetCurrent;
 
     return real_dlsym_225(handle, symbol);
 }
@@ -557,6 +623,10 @@ CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion, uint6
     if (strcmp(symbol, "cuCtxSynchronize") == 0)            { *pfn = (void *)&cuCtxSynchronize; return CUDA_SUCCESS; }
     if (strcmp(symbol, "cuModuleLoadData") == 0)            { *pfn = (void *)&cuModuleLoadData; return CUDA_SUCCESS; }
     if (strcmp(symbol, "cuModuleGetFunction") == 0)         { *pfn = (void *)&cuModuleGetFunction; return CUDA_SUCCESS; }
+    if (strcmp(symbol, "cuCtxCreate") == 0)                { *pfn = (void *)&cuCtxCreate; return CUDA_SUCCESS; }
+    if (strcmp(symbol, "cuCtxDestroy") == 0)               { *pfn = (void *)&cuCtxDestroy; return CUDA_SUCCESS; }
+    if (strcmp(symbol, "cuCtxSetCurrent") == 0)            { *pfn = (void *)&cuCtxSetCurrent; return CUDA_SUCCESS; }
+    if (strcmp(symbol, "cuCtxGetCurrent") == 0)            { *pfn = (void *)&cuCtxGetCurrent; return CUDA_SUCCESS; }
 
     /* Not intercepted: return NULL to let CUDA handle it (will likely fail,
      * which is expected for APIs we don't yet support). */

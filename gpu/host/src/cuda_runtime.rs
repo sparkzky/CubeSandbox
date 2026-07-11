@@ -215,4 +215,39 @@ impl CudaRuntime {
             cu_module_unload(module)
         }
     }
+    pub fn ctx_create(&self, flags: u32, device: i32) -> Result<u64, CuResult> {
+        unsafe {
+            let cu_ctx_create: Symbol<unsafe extern "C" fn(*mut u64, u32, i32) -> CuResult> =
+                self.lib.get(b"cuCtxCreate_v2\0").unwrap();
+            let mut ctx: u64 = 0;
+            let result = cu_ctx_create(&mut ctx, flags, device);
+            if result == 0 { Ok(ctx) } else { Err(result) }
+        }
+    }
+
+    pub fn ctx_set_current(&self, ctx: u64) -> CuResult {
+        unsafe {
+            let cu_ctx_set: Symbol<unsafe extern "C" fn(u64) -> CuResult> =
+                self.lib.get(b"cuCtxSetCurrent_v2\0").unwrap();
+            cu_ctx_set(ctx)
+        }
+    }
+
+    pub fn ctx_get_current(&self) -> u64 {
+        unsafe {
+            let cu_ctx_get: Symbol<unsafe extern "C" fn(*mut u64) -> CuResult> =
+                self.lib.get(b"cuCtxGetCurrent_v2\0").unwrap();
+            let mut ctx: u64 = 0;
+            cu_ctx_get(&mut ctx);
+            ctx
+        }
+    }
+
+    pub fn ctx_destroy(&self, ctx: u64) -> CuResult {
+        unsafe {
+            let cu_ctx_destroy: Symbol<unsafe extern "C" fn(u64) -> CuResult> =
+                self.lib.get(b"cuCtxDestroy_v2\0").unwrap();
+            cu_ctx_destroy(ctx)
+        }
+    }
 }

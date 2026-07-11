@@ -31,6 +31,10 @@ pub const CUBE_GPU_API_STREAM_CREATE: u32    = 30;
 pub const CUBE_GPU_API_STREAM_DESTROY: u32   = 31;
 pub const CUBE_GPU_API_STREAM_SYNC: u32      = 32;
 pub const CUBE_GPU_API_DEVICE_SYNC: u32      = 33;
+pub const CUBE_GPU_API_CTX_CREATE: u32      = 50;
+pub const CUBE_GPU_API_CTX_DESTROY: u32     = 51;
+pub const CUBE_GPU_API_CTX_SET_CURRENT: u32 = 52;
+pub const CUBE_GPU_API_CTX_GET_CURRENT: u32 = 53;
 
 // Header flags — must mirror gpu/proto/rpc_protocol.h (CUBE_GPU_FLAG_*)
 pub const CUBE_GPU_FLAG_NONE: u32     = 0x00;
