@@ -46,7 +46,7 @@ func TestCreateSnapshotSuccessResponse(t *testing.T) {
 		}
 		return "node-a", "10.0.0.1", nil
 	}
-	createSnapshotFn = func(ctx context.Context, requestID, sandboxID, nodeID, nodeIP, displayName, backend string) (*types.TemplateImageJobInfo, error) {
+	createSnapshotFn = func(ctx context.Context, requestID, sandboxID, nodeID, nodeIP, displayName, alias, backend string) (*types.TemplateImageJobInfo, error) {
 		return &types.TemplateImageJobInfo{
 			JobID:        "op-1",
 			TemplateID:   "snap-1",
@@ -117,7 +117,7 @@ func TestCreateSnapshotAcceptsSnakeCaseRequestID(t *testing.T) {
 	resolveSnapshotHostFn = func(ctx context.Context, requestID, sandboxID string) (string, string, error) {
 		return "node-a", "10.0.0.1", nil
 	}
-	createSnapshotFn = func(ctx context.Context, requestID, sandboxID, nodeID, nodeIP, displayName, backend string) (*types.TemplateImageJobInfo, error) {
+	createSnapshotFn = func(ctx context.Context, requestID, sandboxID, nodeID, nodeIP, displayName, alias, backend string) (*types.TemplateImageJobInfo, error) {
 		return &types.TemplateImageJobInfo{JobID: "op-2", TemplateID: "snap-2", RequestID: requestID}, nil
 	}
 	getSnapshotInfoFn = func(ctx context.Context, snapshotID string, includeRequest bool) (*templatecenter.SnapshotInfo, error) {
@@ -157,7 +157,7 @@ func TestCreateSnapshotDetachesExecutionFromCanceledRequest(t *testing.T) {
 		}
 		return "node-a", "10.0.0.1", nil
 	}
-	createSnapshotFn = func(ctx context.Context, requestID, sandboxID, nodeID, nodeIP, displayName, backend string) (*types.TemplateImageJobInfo, error) {
+	createSnapshotFn = func(ctx context.Context, requestID, sandboxID, nodeID, nodeIP, displayName, alias, backend string) (*types.TemplateImageJobInfo, error) {
 		select {
 		case <-ctx.Done():
 			t.Fatalf("snapshot execution context should not be canceled with the HTTP request: %v", ctx.Err())

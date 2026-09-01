@@ -976,11 +976,24 @@ func GetTemplateByAlias(ctx context.Context, alias string) (*models.TemplateDefi
 	return getTemplateByAliasTx(store.db.WithContext(ctx), alias)
 }
 
-// ResolveTemplateIdentifier resolves an identifier that may be either a
-// template ID (tpl-.../snap-...) or a human-readable alias. If the identifier
-// already has a valid template ID prefix it is returned unchanged. Otherwise
-// it is treated as an alias and resolved to the underlying template ID.
-// Returns ("", nil) for an empty identifier.
+// ResolveTemplateIdentifier resolves an identifier that may be a template ID
+// (tpl-.../snap-...), a template alias, or a snapshot alias key
+// ("alias:tag"). If the identifier already has a valid template ID prefix it
+// is returned unchanged. Otherwise any "ns/" prefix is stripped (CubeSandbox
+// has a single flat alias namespace, mirroring CubeAPI's alias_from_name)
+// and the remainder is resolved with a deterministic order:
+//
+//  1. template alias exact match (t_cube_template_definition.alias_key);
+//  2. snapshot alias exact match (t_cube_snapshot.alias, "alias:tag");
+//  3. "<identifier>:default" snapshot key, for tag-less identifiers only.
+//
+// The two alias spaces are structurally disjoint — snapshot keys always
+// contain the ':' tag separator, template aliases forbid it — so the order
+// above can never be ambiguous for a qualified key; a bare alias resolves
+// to the template when both exist.
+//
+// Returns ("", nil) for an empty identifier and ErrTemplateNotFound when
+// nothing matches (preserving the historical error contract of callers).
 func ResolveTemplateIdentifier(ctx context.Context, identifier string) (string, error) {
 	identifier = strings.TrimSpace(identifier)
 	if identifier == "" {
@@ -989,11 +1002,28 @@ func ResolveTemplateIdentifier(ctx context.Context, identifier string) (string, 
 	if hasValidTemplateIDPrefix(identifier) {
 		return identifier, nil
 	}
-	def, err := GetTemplateByAlias(ctx, identifier)
-	if err != nil {
+	lookup := stripAliasNamespace(identifier)
+	if lookup == "" {
+		return "", ErrTemplateNotFound
+	}
+	def, err := GetTemplateByAlias(ctx, lookup)
+	if err == nil {
+		return def.TemplateID, nil
+	}
+	if !errors.Is(err, ErrTemplateNotFound) {
 		return "", err
 	}
-	return def.TemplateID, nil
+	// Snapshot alias fallback (issue #1522): deriveDefault lets a tag-less
+	// alias such as "my-snapshot" resolve to the "my-snapshot:default"
+	// snapshot, matching official E2B. Only this create-side resolution
+	// derives the default tag — snapshot delete/rollback endpoints resolve
+	// exactly so a bare alias can never shadow-act on a snapshot.
+	if snapshotID, snapshotErr := ResolveSnapshotAlias(ctx, lookup, true); snapshotErr == nil {
+		return snapshotID, nil
+	} else if !errors.Is(snapshotErr, ErrSnapshotNotFound) && !errors.Is(snapshotErr, ErrTemplateStoreNotInitialized) {
+		return "", snapshotErr
+	}
+	return "", err
 }
 
 func claimTemplateAliasTx(tx *gorm.DB, templateID, alias string) error {

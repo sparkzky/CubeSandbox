@@ -71,6 +71,7 @@ type snapshotCreateJobRequest struct {
 	NodeID          string `json:"node_id"`
 	NodeIP          string `json:"node_ip"`
 	DisplayName     string `json:"display_name,omitempty"`
+	Alias           string `json:"alias,omitempty"`
 	Backend         string `json:"backend,omitempty"`
 	SpecFingerprint string `json:"spec_fingerprint,omitempty"`
 }
@@ -107,7 +108,7 @@ type snapshotRollbackResult struct {
 // existed). This removes the historical requirement that callers re-supply the
 // original CreateCubeSandboxReq, which was the original motivation for this
 // refactor.
-func SubmitSandboxSnapshot(ctx context.Context, requestID, sandboxID, hostID, hostIP, displayName, backend string) (*sandboxtypes.TemplateImageJobInfo, error) {
+func SubmitSandboxSnapshot(ctx context.Context, requestID, sandboxID, hostID, hostIP, displayName, alias, backend string) (*sandboxtypes.TemplateImageJobInfo, error) {
 	if !isReady() {
 		return nil, ErrTemplateStoreNotInitialized
 	}
@@ -121,6 +122,15 @@ func SubmitSandboxSnapshot(ctx context.Context, requestID, sandboxID, hostID, ho
 	}
 	nodeID := strings.TrimSpace(hostID)
 	nodeIP := strings.TrimSpace(hostIP)
+	alias = strings.TrimSpace(alias)
+	if alias != "" {
+		// Defense in depth: CubeAPI validates before sending, but master is
+		// also reachable directly (CLI / curl) and must not persist an alias
+		// that violates the column charset or width.
+		if err := ValidateSnapshotAliasKey(alias); err != nil {
+			return nil, err
+		}
+	}
 
 	originReq, err := loadSandboxCreateRequestFn(ctx, sandboxID)
 	if err != nil {
@@ -155,7 +165,7 @@ func SubmitSandboxSnapshot(ctx context.Context, requestID, sandboxID, hostID, ho
 			if existing.Operation != JobOperationSnapshotCreate {
 				return fmt.Errorf("%w: request %s is already bound to %s", ErrTemplateAttemptInProgress, requestID, existing.Operation)
 			}
-			if !snapshotCreateRequestMatches(existing.RequestJSON, requestID, sandboxID, nodeID, nodeIP, displayName, normalizedBackend, storedReq) {
+			if !snapshotCreateRequestMatches(existing.RequestJSON, requestID, sandboxID, nodeID, nodeIP, displayName, alias, normalizedBackend, storedReq) {
 				return fmt.Errorf("%w: request %s payload does not match existing snapshot create job", ErrTemplateAttemptInProgress, requestID)
 			}
 			jobID = existing.JobID
@@ -190,6 +200,7 @@ func SubmitSandboxSnapshot(ctx context.Context, requestID, sandboxID, hostID, ho
 			NodeID:          nodeID,
 			NodeIP:          nodeIP,
 			DisplayName:     displayName,
+			Alias:           alias,
 			Backend:         normalizedBackend,
 			SpecFingerprint: fingerprint,
 		})
@@ -228,8 +239,32 @@ func SubmitSandboxSnapshot(ctx context.Context, requestID, sandboxID, hostID, ho
 			RootfsSizeBytesAtSnapshot: parseSystemDiskSizeBytes(storedReq),
 			Status:                    StatusCreating,
 		}
+		if alias != "" {
+			claimAlias := alias
+			snapRec.Alias = &claimAlias
+		}
 		return store.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			// Fast-path conflict detection for the common case (alias already
+			// claimed). Deliberately a plain SELECT — no FOR UPDATE: under MySQL
+			// REPEATABLE READ a non-matching locking read takes a gap lock, and
+			// two concurrent creates claiming *different* aliases in the same
+			// index gap would deadlock on their insert-intention locks. The
+			// unique index is the authoritative guard; the race window simply
+			// falls through to the duplicate-key mapping below.
+			if alias != "" {
+				var claimed int64
+				if err := tx.Table(constants.SnapshotTableName).
+					Where("alias = ?", alias).Count(&claimed).Error; err != nil {
+					return err
+				}
+				if claimed > 0 {
+					return fmt.Errorf("%w: %s", ErrSnapshotAliasConflict, alias)
+				}
+			}
 			if err := createSnapshotTx(ctx, tx, snapshotID, storedReq, createReq.InstanceType, constants.GetAppSnapshotVersion(createReq.Annotations), snapRec); err != nil {
+				if alias != "" && (isDuplicateKeyError(err) || errors.Is(err, ErrDuplicateTemplate)) {
+					return fmt.Errorf("%w: %s", ErrSnapshotAliasConflict, alias)
+				}
 				return err
 			}
 			return tx.Table(constants.TemplateImageJobTableName).Create(record).Error
@@ -431,6 +466,14 @@ func RollbackSandboxToSnapshot(ctx context.Context, requestID, sandboxID, snapsh
 	}
 	if strings.TrimSpace(requestID) == "" {
 		return nil, errors.New("requestID is required")
+	}
+	// Accept an exact alias key ("alias:tag") alongside raw snap-* ids.
+	// Normalized before any lock is taken so idempotent retries (which may
+	// re-send the alias) and the job payload both key on the canonical id.
+	if resolved, err := NormalizeSnapshotRef(ctx, snapshotID); err != nil {
+		return nil, err
+	} else {
+		snapshotID = resolved
 	}
 	var jobID string
 	reusedExistingJob := false
@@ -661,6 +704,13 @@ func DeleteSnapshot(ctx context.Context, requestID, snapshotID, instanceType str
 	}
 	if strings.TrimSpace(requestID) == "" {
 		return nil, errors.New("requestID is required")
+	}
+	// Accept an exact alias key ("alias:tag") alongside raw snap-* ids;
+	// resolved before locking, locks and job records use the canonical id.
+	if resolved, err := NormalizeSnapshotRef(ctx, snapshotID); err != nil {
+		return nil, err
+	} else {
+		snapshotID = resolved
 	}
 	var jobID string
 	reusedExistingJob := false
@@ -1474,7 +1524,7 @@ func snapshotJobFailedError(info *sandboxtypes.TemplateImageJobInfo) error {
 // canonical spec fingerprint. Because the spec is now fetched from sandboxspec
 // on every call instead of being carried in the payload, we compare via
 // fingerprint rather than deep-equal.
-func snapshotCreateRequestMatches(raw, requestID, sandboxID, nodeID, nodeIP, displayName, backend string, currentSpec *sandboxtypes.CreateCubeSandboxReq) bool {
+func snapshotCreateRequestMatches(raw, requestID, sandboxID, nodeID, nodeIP, displayName, alias, backend string, currentSpec *sandboxtypes.CreateCubeSandboxReq) bool {
 	if strings.TrimSpace(raw) == "" {
 		return true
 	}
@@ -1482,7 +1532,7 @@ func snapshotCreateRequestMatches(raw, requestID, sandboxID, nodeID, nodeIP, dis
 	if err := json.Unmarshal([]byte(raw), &existing); err != nil {
 		return false
 	}
-	if existing.RequestID != requestID || existing.SandboxID != sandboxID || existing.NodeID != nodeID || existing.NodeIP != nodeIP || existing.DisplayName != displayName {
+	if existing.RequestID != requestID || existing.SandboxID != sandboxID || existing.NodeID != nodeID || existing.NodeIP != nodeIP || existing.DisplayName != displayName || existing.Alias != alias {
 		return false
 	}
 	if existing.Backend != "" && backend != "" && !strings.EqualFold(existing.Backend, backend) {

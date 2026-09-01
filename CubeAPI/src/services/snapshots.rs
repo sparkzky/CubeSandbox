@@ -14,6 +14,7 @@ use crate::{
         DeleteSnapshotResponse as ApiDeleteSnapshotResponse, RollbackResponse, SnapshotInfo,
         SnapshotListItem,
     },
+    services::templates::is_valid_alias,
 };
 
 #[derive(Clone)]
@@ -42,10 +43,21 @@ impl SnapshotService {
         let create_request = self
             .build_create_request_payload(sandbox_id, &request_id)
             .await?;
+        // Parse the E2B name once: display_name is the namespace-stripped
+        // name (what the SDK sees in `names`), alias is the qualified key
+        // ("alias:tag", tag defaulted) master claims and we echo back as
+        // `snapshotID`. An unparseable name degrades to an alias-less
+        // snapshot (raw snap-* id) rather than failing the request,
+        // mirroring the template path's silent-drop convention.
+        let ParsedSnapshotName {
+            display_name,
+            alias,
+        } = parse_snapshot_name(name.as_deref());
         let req = CreateSnapshotRequest {
             request_id: request_id.clone(),
             sandbox_id: sandbox_id.to_string(),
-            display_name: name,
+            display_name,
+            alias,
             create_request,
             backend,
         };
@@ -56,7 +68,10 @@ impl SnapshotService {
                     if e.is_not_found() {
                         sandbox_not_found(sandbox_id)
                     } else if e.is_conflict() {
-                        snapshot_create_conflict(sandbox_id)
+                        // Surface master's ret_msg verbatim: it distinguishes
+                        // "snapshot name already exists" (alias conflict)
+                        // from "active snapshot operation in progress".
+                        AppError::Conflict(format!("sandbox {}: {}", sandbox_id, e))
                     } else {
                         internal_error(e)
                     }
@@ -129,24 +144,26 @@ impl SnapshotService {
     // for a terminal state and does not expose a polling interface.
 
     pub async fn delete(&self, snapshot_id: &str) -> AppResult<ApiDeleteSnapshotResponse> {
+        let snapshot_id = normalize_snapshot_identifier(snapshot_id);
         let req = DeleteSnapshotRequest {
             request_id: new_request_id(),
             instance_type: self.instance_type.clone(),
         };
 
-        match self.cubemaster.delete_snapshot(snapshot_id, &req).await {
+        match self.cubemaster.delete_snapshot(&snapshot_id, &req).await {
             Ok(resp) => {
                 let operation_id = required_operation_id(resp.operation_id(), "snapshot delete")?;
                 resp.ret.as_result().map_err(|e| {
                     if e.is_not_found() {
-                        snapshot_not_found(snapshot_id)
+                        snapshot_not_found(snapshot_id.as_str())
                     } else if e.is_conflict() {
-                        snapshot_delete_conflict(snapshot_id)
+                        snapshot_delete_conflict(snapshot_id.as_str())
                     } else {
                         internal_error(e)
                     }
                 })?;
-                let status = ensure_operation_ready(resp.status(), "snapshot delete", snapshot_id)?;
+                let status =
+                    ensure_operation_ready(resp.status(), "snapshot delete", snapshot_id.as_str())?;
 
                 Ok(ApiDeleteSnapshotResponse {
                     template_id: snapshot_id.to_string(),
@@ -154,18 +171,25 @@ impl SnapshotService {
                     status,
                 })
             }
-            Err(e) if e.is_not_found() => Err(snapshot_not_found(snapshot_id)),
+            Err(e) if e.is_not_found() => Err(snapshot_not_found(&snapshot_id)),
+            Err(e) if e.is_invalid_path_parameter() || e.is_params_error() => {
+                Err(AppError::BadRequest(e.to_string()))
+            }
             Err(e) => Err(internal_error(e)),
         }
     }
 
     pub async fn has_snapshot(&self, snapshot_id: &str) -> AppResult<bool> {
-        match self.cubemaster.get_snapshot(snapshot_id, false).await {
+        let snapshot_id = normalize_snapshot_identifier(snapshot_id);
+        match self.cubemaster.get_snapshot(&snapshot_id, false).await {
             Ok(resp) => {
                 resp.ret.as_result().map_err(internal_error)?;
                 Ok(true)
             }
             Err(e) if e.is_not_found() => Ok(false),
+            Err(e) if e.is_invalid_path_parameter() || e.is_params_error() => {
+                Err(AppError::BadRequest(e.to_string()))
+            }
             Err(e) => Err(internal_error(e)),
         }
     }
@@ -210,6 +234,9 @@ impl SnapshotService {
             }
             Err(e) if e.is_not_found() => {
                 Err(sandbox_or_snapshot_not_found(sandbox_id, snapshot_id))
+            }
+            Err(e) if e.is_invalid_path_parameter() || e.is_params_error() => {
+                Err(AppError::BadRequest(e.to_string()))
             }
             Err(e) => Err(internal_error(e)),
         }
@@ -345,11 +372,83 @@ fn sandbox_or_snapshot_not_found(sandbox_id: &str, snapshot_id: &str) -> AppErro
     ))
 }
 
-fn snapshot_create_conflict(sandbox_id: &str) -> AppError {
-    AppError::Conflict(format!(
-        "sandbox {} has a snapshot operation in progress",
-        sandbox_id
-    ))
+/// Tag master appends (and resolves back) when an E2B name carries no
+/// explicit tag; mirrors templatecenter's SnapshotAliasTagDefault.
+const SNAPSHOT_ALIAS_TAG_DEFAULT: &str = "default";
+
+/// t_cube_snapshot.alias column width; alias ≤64 + ':' + tag ≤63.
+const SNAPSHOT_ALIAS_KEY_MAX_LEN: usize = 128;
+
+/// Parsed form of the E2B `SandboxSnapshotRequest.name`.
+struct ParsedSnapshotName {
+    /// Namespace-stripped name, verbatim including any user tag — this is
+    /// what the SDK sees in `names` and what master stores as display_name.
+    display_name: Option<String>,
+    /// Qualified alias key ("alias:tag", tag defaulted to "default") that
+    /// master claims; None when no valid alias can be derived.
+    alias: Option<String>,
+}
+
+/// Parse an E2B snapshot name ("alias[:tag]", optionally "ns/alias[:tag]")
+/// into the display name and the qualified alias key.
+///
+/// CubeSandbox has a single flat alias namespace, so a leading namespace is
+/// dropped — mirroring `alias_from_name` on the template path. A missing tag
+/// defaults to "default" so `create_snapshot(name="alias")` yields
+/// `snapshotID="alias:default"`, matching official E2B.
+///
+/// Returns alias=None for anything that is not a valid key (missing name,
+/// bad charset, reserved `tpl-`/`snap-` prefix, empty segment, more than one
+/// ':' separator, over-long key): the snapshot is then created without an
+/// alias and `snapshotID` falls back to the raw `snap-*` id — the SDK
+/// contract's fallback shape. Invalid names degrade instead of failing the
+/// request, mirroring the template path's silent-drop convention.
+fn parse_snapshot_name(name: Option<&str>) -> ParsedSnapshotName {
+    let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) else {
+        return ParsedSnapshotName {
+            display_name: None,
+            alias: None,
+        };
+    };
+    // Strip namespace: keep the last path segment. The "registry:5000/x"
+    // image-ref shape needs no special case — its tag lookalike ("5000")
+    // contains no '/' so the segment split happens on '/' first either way.
+    let stripped = name.rsplit('/').next().unwrap_or(name).trim();
+    if stripped.is_empty() {
+        return ParsedSnapshotName {
+            display_name: Some(name.to_string()),
+            alias: None,
+        };
+    }
+    let (alias, tag) = match stripped.split_once(':') {
+        Some((alias, tag)) => (alias, tag),
+        None => (stripped, SNAPSHOT_ALIAS_TAG_DEFAULT),
+    };
+    let valid = !alias.is_empty()
+        && !tag.is_empty()
+        && !alias.contains(':')
+        && !tag.contains(':')
+        && is_valid_alias(alias)
+        && is_valid_alias(tag)
+        && alias.len() + 1 + tag.len() <= SNAPSHOT_ALIAS_KEY_MAX_LEN;
+    ParsedSnapshotName {
+        display_name: Some(stripped.to_string()),
+        alias: valid.then(|| format!("{alias}:{tag}")),
+    }
+}
+
+/// Normalise a client-supplied snapshot identifier before it travels to
+/// master in a URL path: trim and strip any "ns/" prefix ('/' can never be a
+/// path segment character). Tag handling stays with master, the single
+/// resolution authority.
+fn normalize_snapshot_identifier(identifier: &str) -> String {
+    let trimmed = identifier.trim();
+    trimmed
+        .rsplit('/')
+        .next()
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string()
 }
 
 fn snapshot_delete_conflict(snapshot_id: &str) -> AppError {
@@ -358,7 +457,6 @@ fn snapshot_delete_conflict(snapshot_id: &str) -> AppError {
         snapshot_id
     ))
 }
-
 fn rollback_conflict(sandbox_id: &str, snapshot_id: &str) -> AppError {
     AppError::Conflict(format!(
         "rollback conflict: sandbox={} snapshot={}",
@@ -371,10 +469,22 @@ fn snapshot_resource_to_info(r: SnapshotResource) -> SnapshotInfo {
     let backend = snapshot_backend(&r);
     let remote_status = optional_backend(&r.remote_status);
     SnapshotInfo {
-        snapshot_id: r.snapshot_id,
+        snapshot_id: qualified_snapshot_id(&r),
         names,
         backend,
         remote_status,
+    }
+}
+
+/// The identifier the E2B SDK round-trips (create → `Sandbox.create` →
+/// `delete_snapshot`): the qualified alias when one was claimed, else the
+/// raw `snap-*` id (the SDK contract's fallback shape).
+fn qualified_snapshot_id(r: &SnapshotResource) -> String {
+    let alias = r.alias.trim();
+    if !alias.is_empty() {
+        alias.to_string()
+    } else {
+        r.snapshot_id.clone()
     }
 }
 
@@ -421,7 +531,7 @@ fn snapshot_resource_to_list_item(r: SnapshotResource) -> SnapshotListItem {
     let backend = snapshot_backend(&r);
     let remote_status = optional_backend(&r.remote_status);
     SnapshotListItem {
-        snapshot_id: r.snapshot_id,
+        snapshot_id: qualified_snapshot_id(&r),
         names,
         status: r.status,
         origin_sandbox_id: if r.origin_sandbox_id.is_empty() {
@@ -487,6 +597,9 @@ fn snapshot_names(resource: &SnapshotResource) -> Vec<String> {
     if !resource.display_name.trim().is_empty() {
         return vec![resource.display_name.clone()];
     }
+    if !resource.alias.trim().is_empty() {
+        return vec![resource.alias.clone()];
+    }
     if resource.snapshot_id.trim().is_empty() {
         return Vec::new();
     }
@@ -510,6 +623,7 @@ mod tests {
             snapshot_id: "snap-1".into(),
             names: vec!["snap-name".into()],
             display_name: "snap-name".into(),
+            alias: String::new(),
             status: status.into(),
             origin_sandbox_id: "sb-1".into(),
             origin_node_id: "node-a".into(),
@@ -615,5 +729,106 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("snap-name")
         );
+    }
+
+    #[test]
+    fn aliased_snapshot_reports_qualified_alias_as_snapshot_id() {
+        let mut snapshot = sample_snapshot("READY");
+        // Master never populates `names` (CubeAPI synthesizes it from
+        // display_name / alias); clear the fixture's artificial value.
+        snapshot.names.clear();
+        snapshot.display_name = "agentscope-run".into();
+        snapshot.alias = "agentscope-run:default".into();
+
+        let info = snapshot_resource_to_info(snapshot.clone());
+        assert_eq!(info.snapshot_id, "agentscope-run:default");
+        assert_eq!(info.names, vec!["agentscope-run".to_string()]);
+
+        let list_item = snapshot_resource_to_list_item(snapshot);
+        assert_eq!(list_item.snapshot_id, "agentscope-run:default");
+        assert_eq!(list_item.names, vec!["agentscope-run".to_string()]);
+    }
+
+    #[test]
+    fn parse_snapshot_name_derives_qualified_alias_keys() {
+        // Plain alias: tag defaults to "default" (official E2B shape).
+        let parsed = parse_snapshot_name(Some("agentscope-run"));
+        assert_eq!(parsed.display_name.as_deref(), Some("agentscope-run"));
+        assert_eq!(parsed.alias.as_deref(), Some("agentscope-run:default"));
+
+        // Explicit tag survives verbatim.
+        let parsed = parse_snapshot_name(Some("foo:v2"));
+        assert_eq!(parsed.display_name.as_deref(), Some("foo:v2"));
+        assert_eq!(parsed.alias.as_deref(), Some("foo:v2"));
+
+        // Namespace is stripped (flat alias namespace).
+        let parsed = parse_snapshot_name(Some("team-slug/foo"));
+        assert_eq!(parsed.display_name.as_deref(), Some("foo"));
+        assert_eq!(parsed.alias.as_deref(), Some("foo:default"));
+
+        let parsed = parse_snapshot_name(Some("team-slug/foo:v2"));
+        assert_eq!(parsed.display_name.as_deref(), Some("foo:v2"));
+        assert_eq!(parsed.alias.as_deref(), Some("foo:v2"));
+
+        // Whitespace is trimmed; absent/empty name yields nothing.
+        let parsed = parse_snapshot_name(Some("  foo  "));
+        assert_eq!(parsed.alias.as_deref(), Some("foo:default"));
+        let parsed = parse_snapshot_name(None);
+        assert_eq!(parsed.display_name, None);
+        assert_eq!(parsed.alias, None);
+        let parsed = parse_snapshot_name(Some("   "));
+        assert_eq!(parsed.display_name, None);
+        assert_eq!(parsed.alias, None);
+    }
+
+    #[test]
+    fn parse_snapshot_name_drops_invalid_aliases() {
+        for name in [
+            "UPPER",       // invalid charset
+            "foo_bar",     // underscore not in alias charset
+            "snap-foo",    // reserved id prefix
+            "tpl-foo",     // reserved id prefix
+            "foo:",        // empty tag
+            ":v2",         // empty alias
+            "foo:bar:baz", // multiple separators
+            "foo:Bar",     // invalid tag charset
+            "foo snap",    // whitespace inside
+        ] {
+            let parsed = parse_snapshot_name(Some(name));
+            assert_eq!(parsed.alias, None, "alias for {name:?} should be dropped");
+        }
+        // Display name still records the namespace-stripped input verbatim.
+        let parsed = parse_snapshot_name(Some("team/UPPER"));
+        assert_eq!(parsed.display_name.as_deref(), Some("UPPER"));
+        assert_eq!(parsed.alias, None);
+    }
+
+    #[test]
+    fn parse_snapshot_name_enforces_key_length_budget() {
+        let alias64 = "a".repeat(64);
+        let tag63 = "b".repeat(63);
+        // 64 + 1 + 63 = 128 fits.
+        assert_eq!(
+            parse_snapshot_name(Some(&format!("{alias64}:{tag63}"))).alias,
+            Some(format!("{alias64}:{tag63}"))
+        );
+        // 64 + 1 + 64 = 129 exceeds the t_cube_snapshot.alias column width.
+        let tag64 = "b".repeat(64);
+        assert_eq!(
+            parse_snapshot_name(Some(&format!("{alias64}:{tag64}"))).alias,
+            None
+        );
+    }
+
+    #[test]
+    fn normalize_snapshot_identifier_strips_namespace_and_trims() {
+        assert_eq!(normalize_snapshot_identifier("foo:default"), "foo:default");
+        assert_eq!(
+            normalize_snapshot_identifier("ns/foo:default"),
+            "foo:default"
+        );
+        assert_eq!(normalize_snapshot_identifier("  ns/foo  "), "foo");
+        assert_eq!(normalize_snapshot_identifier("snap-1"), "snap-1");
+        assert_eq!(normalize_snapshot_identifier(""), "");
     }
 }

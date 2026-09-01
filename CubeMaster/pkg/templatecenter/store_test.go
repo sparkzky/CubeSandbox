@@ -559,10 +559,11 @@ func TestResolveTemplateIdentifierPassthrough(t *testing.T) {
 	}
 }
 
-// TestResolveTemplateIdentifierAliasLookup verifies the alias-resolution path:
-// a bare identifier (no tpl-/snap- prefix) is resolved through
-// GetTemplateByAlias. The DB call itself is stubbed via gomonkey so the test
-// exercises the routing logic, not gorm internals.
+// TestResolveTemplateIdentifierAliasLookup verifies the alias-resolution
+// path: a bare identifier (no tpl-/snap- prefix) is resolved through
+// GetTemplateByAlias first, then through the snapshot-alias fallback
+// (issue #1522). The DB calls are stubbed via gomonkey so the test exercises
+// the routing logic, not gorm internals.
 func TestResolveTemplateIdentifierAliasLookup(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
@@ -574,6 +575,17 @@ func TestResolveTemplateIdentifierAliasLookup(t *testing.T) {
 		return nil, ErrTemplateNotFound
 	})
 
+	patches.ApplyFunc(ResolveSnapshotAlias, func(_ context.Context, identifier string, deriveDefault bool) (string, error) {
+		switch identifier {
+		case "shot-alias":
+			return "snap-resolved", nil
+		case "err-check":
+			return "", errors.New("boom")
+		default:
+			return "", ErrSnapshotNotFound
+		}
+	})
+
 	got, err := ResolveTemplateIdentifier(context.Background(), "my-alias")
 	if err != nil {
 		t.Fatalf("ResolveTemplateIdentifier(\"my-alias\") returned error: %v", err)
@@ -582,10 +594,38 @@ func TestResolveTemplateIdentifierAliasLookup(t *testing.T) {
 		t.Fatalf("ResolveTemplateIdentifier(\"my-alias\") = %q, want \"tpl-resolved\"", got)
 	}
 
-	// Not-found alias must propagate the error verbatim.
+	// Template alias wins over a snapshot alias for the same bare identifier.
+	got, err = ResolveTemplateIdentifier(context.Background(), "my-alias")
+	if err != nil || got != "tpl-resolved" {
+		t.Fatalf("template alias must take precedence, got %q err=%v", got, err)
+	}
+
+	// Snapshot fallback resolves identifiers the template table does not own.
+	got, err = ResolveTemplateIdentifier(context.Background(), "shot-alias")
+	if err != nil {
+		t.Fatalf("ResolveTemplateIdentifier(\"shot-alias\") returned error: %v", err)
+	}
+	if got != "snap-resolved" {
+		t.Fatalf("ResolveTemplateIdentifier(\"shot-alias\") = %q, want \"snap-resolved\"", got)
+	}
+
+	// Namespaced identifiers resolve on their last segment (flat namespace).
+	got, err = ResolveTemplateIdentifier(context.Background(), "team/shot-alias")
+	if err != nil || got != "snap-resolved" {
+		t.Fatalf("namespaced identifier must strip namespace, got %q err=%v", got, err)
+	}
+
+	// Not-found alias must surface ErrTemplateNotFound.
 	_, err = ResolveTemplateIdentifier(context.Background(), "missing-alias")
 	if !errors.Is(err, ErrTemplateNotFound) {
 		t.Fatalf("ResolveTemplateIdentifier(\"missing-alias\") error = %v, want ErrTemplateNotFound", err)
+	}
+
+	// A non-not-found DB error from the snapshot fallback must propagate
+	// instead of being masked by ErrTemplateNotFound.
+	_, err = ResolveTemplateIdentifier(context.Background(), "err-check")
+	if err == nil || errors.Is(err, ErrTemplateNotFound) {
+		t.Fatalf("snapshot fallback error must propagate, got %v", err)
 	}
 }
 

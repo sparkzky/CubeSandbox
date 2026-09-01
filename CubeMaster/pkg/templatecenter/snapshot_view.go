@@ -27,6 +27,7 @@ type SnapshotInfo struct {
 	Version                   string                             `json:"version,omitempty"`
 	Status                    string                             `json:"status,omitempty"`
 	DisplayName               string                             `json:"display_name,omitempty"`
+	Alias                     string                             `json:"alias,omitempty"`
 	OriginSandboxID           string                             `json:"origin_sandbox_id,omitempty"`
 	OriginNodeID              string                             `json:"origin_node_id,omitempty"`
 	OriginNodeIP              string                             `json:"origin_node_ip,omitempty"`
@@ -111,6 +112,13 @@ func ListSnapshots(ctx context.Context, opts *ListSnapshotsOptions) ([]SnapshotI
 }
 
 func GetSnapshotInfo(ctx context.Context, snapshotID string, includeRequest bool) (*SnapshotInfo, error) {
+	// Accept an exact alias key ("alias:tag", namespace stripped) alongside
+	// raw snap-* ids. No ":default" derivation here — see ResolveSnapshotAlias.
+	if resolved, err := NormalizeSnapshotRef(ctx, snapshotID); err != nil {
+		return nil, err
+	} else {
+		snapshotID = resolved
+	}
 	rec, err := getSnapshotRecord(ctx, strings.TrimSpace(snapshotID))
 	if err != nil {
 		if errors.Is(err, ErrTemplateNotFound) {

@@ -32,6 +32,7 @@ type snapshotCreateRequest struct {
 	RequestID   string `json:"requestID,omitempty"`
 	SandboxID   string `json:"sandbox_id,omitempty"`
 	DisplayName string `json:"display_name,omitempty"`
+	Alias       string `json:"alias,omitempty"`
 	Backend     string `json:"backend,omitempty"`
 }
 
@@ -52,6 +53,7 @@ type snapshotResource struct {
 	Version                   string                      `json:"version,omitempty"`
 	Status                    string                      `json:"status,omitempty"`
 	DisplayName               string                      `json:"display_name,omitempty"`
+	Alias                     string                      `json:"alias,omitempty"`
 	OriginSandboxID           string                      `json:"origin_sandbox_id,omitempty"`
 	OriginNodeID              string                      `json:"origin_node_id,omitempty"`
 	OriginNodeIP              string                      `json:"origin_node_ip,omitempty"`
@@ -136,6 +138,7 @@ var SnapshotCreateCommand = cli.Command{
 	Flags: []cli.Flag{
 		cli.StringFlag{Name: "sandbox-id", Usage: "sandbox id to snapshot"},
 		cli.StringFlag{Name: "display-name", Usage: "snapshot display name"},
+		cli.StringFlag{Name: "alias", Usage: "qualified alias key to claim (\"alias:tag\"; empty tag defaults to :default at the CubeAPI layer)"},
 		cli.BoolFlag{Name: "json", Usage: "print raw json response"},
 	},
 	Action: func(c *cli.Context) error {
@@ -148,6 +151,7 @@ var SnapshotCreateCommand = cli.Command{
 			RequestID:   requestID,
 			SandboxID:   sandboxID,
 			DisplayName: c.String("display-name"),
+			Alias:       c.String("alias"),
 		}
 		body, err := jsoniter.Marshal(req)
 		if err != nil {
@@ -482,6 +486,7 @@ func printSnapshotResponse(rsp *snapshotResponse) {
 	log.Printf("snapshot_id: %s\n", rsp.Snapshot.SnapshotID)
 	log.Printf("status: %s\n", rsp.Snapshot.Status)
 	log.Printf("display_name: %s\n", rsp.Snapshot.DisplayName)
+	log.Printf("alias: %s\n", rsp.Snapshot.Alias)
 	log.Printf("origin_sandbox_id: %s\n", rsp.Snapshot.OriginSandboxID)
 	log.Printf("origin_node_id: %s\n", rsp.Snapshot.OriginNodeID)
 	log.Printf("backend: %s\n", firstNonEmptyCLI(rsp.Snapshot.Backend, rsp.Snapshot.StorageBackend))

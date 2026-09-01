@@ -92,6 +92,7 @@ func snapshotInfoFromRecord(rec *models.SnapshotRecord, replicas []ReplicaStatus
 		Version:                   rec.Version,
 		Status:                    rec.Status,
 		DisplayName:               rec.DisplayName,
+		Alias:                     snapshotAliasFromRecord(rec),
 		OriginSandboxID:           rec.OriginSandboxID,
 		OriginNodeID:              rec.OriginNodeID,
 		OriginNodeIP:              rec.OriginNodeIP,

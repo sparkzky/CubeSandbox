@@ -20,7 +20,7 @@ An alias:
 - is between 1 and 64 characters;
 - must not start with the reserved `tpl-` or `snap-` prefix;
 - belongs to one READY template at a time;
-- cannot be assigned to a snapshot.
+- cannot be assigned to a snapshot (snapshots claim their own *snapshot names* instead — see [Named snapshots](./snapshot-rollback-clone.md#named-snapshots-e2b-compatibility); the two key spaces are disjoint because snapshot names always carry a `:tag`).
 
 Examples of valid aliases are `python`, `python-3-12`, and `app-v2`. Values such as `MyApp`, `my_app`, `-my-app`, and `tpl-custom` are invalid.
 

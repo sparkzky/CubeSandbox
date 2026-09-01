@@ -51,6 +51,7 @@ type snapshotCreateRequest struct {
 	LegacyRequestID string `json:"requestID,omitempty"`
 	SandboxID       string `json:"sandbox_id,omitempty"`
 	DisplayName     string `json:"display_name,omitempty"`
+	Alias           string `json:"alias,omitempty"`
 	Backend         string `json:"backend,omitempty"`
 }
 
@@ -117,6 +118,7 @@ type snapshotResource struct {
 	Version                   string                         `json:"version,omitempty"`
 	Status                    string                         `json:"status,omitempty"`
 	DisplayName               string                         `json:"display_name,omitempty"`
+	Alias                     string                         `json:"alias,omitempty"`
 	OriginSandboxID           string                         `json:"origin_sandbox_id,omitempty"`
 	OriginNodeID              string                         `json:"origin_node_id,omitempty"`
 	OriginNodeIP              string                         `json:"origin_node_ip,omitempty"`
@@ -532,7 +534,7 @@ func createSnapshot(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
 		"RequestId":   requestID,
 		"SandboxHost": hostIP,
 	}))
-	info, err := createSnapshotFn(ctx, requestID, req.SandboxID, hostID, hostIP, req.DisplayName, req.Backend)
+	info, err := createSnapshotFn(ctx, requestID, req.SandboxID, hostID, hostIP, req.DisplayName, req.Alias, req.Backend)
 	if err != nil {
 		code := snapshotErrorCode(err)
 		rt.RetCode = int64(code)
@@ -735,6 +737,8 @@ func snapshotErrorCode(err error) int {
 		return int(errorcode.ErrorCode_Success)
 	case isSnapshotConflictError(err):
 		return int(errorcode.ErrorCode_Conflict)
+	case errors.Is(err, templatecenter.ErrSnapshotAliasConflict):
+		return int(errorcode.ErrorCode_Conflict)
 	case errors.Is(err, templatecenter.ErrSnapshotNotFound),
 		errors.Is(err, templatecenter.ErrSnapshotOperationNotFound),
 		errors.Is(err, templatecenter.ErrTemplateNotFound):
@@ -794,6 +798,7 @@ func snapshotResourceFromInfo(info *templatecenter.SnapshotInfo) *snapshotResour
 		Version:                   info.Version,
 		Status:                    info.Status,
 		DisplayName:               info.DisplayName,
+		Alias:                     info.Alias,
 		OriginSandboxID:           info.OriginSandboxID,
 		OriginNodeID:              info.OriginNodeID,
 		OriginNodeIP:              info.OriginNodeIP,

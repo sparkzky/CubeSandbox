@@ -62,6 +62,35 @@ with Sandbox.create(template=TEMPLATE_ID) as sb:
 
 A snapshot's lifecycle is independent of the sandbox: the snapshot remains usable even after the source sandbox is `kill()`ed. Call `Sandbox.delete_snapshot(snapshot_id)` to clean up when it is no longer needed.
 
+### Named snapshots (E2B compatibility)
+
+Passing `name` to `create_snapshot` claims a **snapshot alias** in addition to the raw `snap-*` id. The returned `snapshot_id` becomes the qualified name `alias:tag` (tag defaults to `default`), matching official E2B — a single value that supports sorting, restore and deletion:
+
+```python
+snap = sb.create_snapshot(name="agentscope-run")
+print(snap.snapshot_id)  # "agentscope-run:default"
+print(snap.names)        # ["agentscope-run"]
+
+# All three restore forms work (namespace prefixes are accepted and stripped):
+Sandbox.create(template=snap.snapshot_id)          # "agentscope-run:default"
+Sandbox.create(template="agentscope-run")          # bare alias (tag-less → :default)
+Sandbox.create(template="team/agentscope-run")     # namespace stripped
+
+Sandbox.delete_snapshot(snap.snapshot_id)          # delete by qualified name
+sb.rollback(snap.snapshot_id)                      # rollback by qualified name
+```
+
+Rules for snapshot names:
+
+- the alias and tag segments use the template-alias charset (`[a-z0-9-]`, 1–64 chars; tag ≤ 63 so the full key fits 128 characters);
+- a name without a tag claims `alias:default`; an explicit tag (`"foo:v2"`) is kept verbatim and can coexist with `foo:default`;
+- each qualified name is claimed by one snapshot at a time — re-creating it returns HTTP 409 until the previous snapshot is deleted;
+- an invalid name (uppercase, `_`, reserved `tpl-`/`snap-` prefix, empty tag) does **not** fail the request: the snapshot is created unnamed and `snapshot_id` falls back to the raw `snap-*` id;
+- deletion uses the exact qualified name (`alias:default`), never a derived default — a bare name that matches a template alias deletes the template, keeping create/delete precedence consistent. Unqualified deletion of a snapshot is not supported;
+- template aliases and snapshot names live in disjoint key spaces (snapshot keys always contain `:`, template aliases never do). When a bare name matches both, the template wins.
+
+Snapshots created before this feature keep their raw `snap-*` ids and remain fully usable; their historical `display_name` values were never validated and are not retroactively claimed as aliases.
+
 ### Listing snapshots
 
 ```python

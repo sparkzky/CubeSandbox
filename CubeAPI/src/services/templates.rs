@@ -417,7 +417,10 @@ fn alias_from_name(value: &str) -> Option<String> {
 /// conform (e.g. "a:b:c" → "a:b", "UPPER" → "UPPER") are silently
 /// dropped rather than forwarded to CubeMaster, where they'd fail with
 /// a less helpful error.
-fn is_valid_alias(alias: &str) -> bool {
+/// Shared with the snapshot path (`snapshot_alias_from_name` in
+/// services/snapshots.rs), which applies the same charset to both the
+/// alias and the tag segment of a qualified snapshot key.
+pub(crate) fn is_valid_alias(alias: &str) -> bool {
     if alias.is_empty() || alias.len() > 64 {
         return false;
     }

@@ -420,6 +420,193 @@ mod tests {
         assert_eq!(body["aliases"], serde_json::json!(["my-alias"]));
     }
 
+    /// Issue #1522: `POST /sandboxes/{id}/snapshots` with an E2B `name`
+    /// must return the qualified alias as `snapshotID` (official E2B shape)
+    /// and forward both the display name and the derived alias key to
+    /// CubeMaster.
+    #[tokio::test]
+    async fn create_snapshot_reports_qualified_alias_snapshot_id() {
+        use axum::routing::post;
+        use axum::{extract::State, routing::get, Json, Router};
+        use serde_json::{json, Value};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let seen_handler = Arc::clone(&seen);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock CubeMaster listener should bind");
+        let address = listener.local_addr().expect("mock CubeMaster address");
+        tokio::spawn(async move {
+            async fn sandbox_info() -> Json<Value> {
+                json!({
+                    "RequestID": "req-info",
+                    "ret": { "ret_code": 0, "ret_msg": "success" },
+                    "data": [{ "sandbox_id": "sb-1", "status": 2, "template_id": "tpl-1" }]
+                })
+                .into()
+            }
+
+            async fn template_lookup() -> Json<Value> {
+                // Business not-found: the create payload falls back to the
+                // minimal form, exactly like a sandbox without a template.
+                json!({
+                    "RequestID": "req-tpl",
+                    "ret": { "ret_code": 130404, "ret_msg": "template not found" }
+                })
+                .into()
+            }
+
+            let seen = seen_handler;
+            async fn create_snapshot(
+                State(seen): axum::extract::State<Arc<Mutex<Vec<(String, String)>>>>,
+                Json(body): Json<Value>,
+            ) -> Json<Value> {
+                seen.lock().await.push((
+                    body["display_name"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    body["alias"].as_str().unwrap_or_default().to_string(),
+                ));
+                json!({
+                    "RequestID": "req-snap",
+                    "ret": { "ret_code": 0, "ret_msg": "success" },
+                    "snapshot": {
+                        "snapshot_id": "snap-1",
+                        "display_name": "foo",
+                        "alias": "foo:default",
+                        "status": "READY"
+                    }
+                })
+                .into()
+            }
+
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/cube/sandbox/info", get(sandbox_info))
+                    .route("/cube/template", get(template_lookup))
+                    .route("/cube/snapshot", post(create_snapshot))
+                    .with_state(seen),
+            )
+            .await
+            .expect("mock CubeMaster server should run");
+        });
+
+        let mut config = ServerConfig::default();
+        config.cubemaster_url = format!("http://{address}");
+        let state = AppState::new(config, arc(NoopLogger)).await;
+        let server = TestServer::new(build_router(state)).expect("router should build");
+
+        let resp = server
+            .post("/sandboxes/sb-1/snapshots")
+            .json(&json!({ "name": "foo" }))
+            .await;
+
+        assert_eq!(resp.status_code(), StatusCode::CREATED);
+        let body: Value = resp.json();
+        assert_eq!(body["snapshotID"], "foo:default");
+        assert_eq!(body["names"], json!(["foo"]));
+
+        let seen = seen.lock().await;
+        assert_eq!(
+            seen.as_slice(),
+            [("foo".to_string(), "foo:default".to_string())],
+            "CubeAPI must forward display_name and the derived alias key"
+        );
+    }
+
+    /// Issue #1522: `DELETE /templates/{alias:tag}` must route to the
+    /// snapshot delete path with the alias key intact (percent-decoded by
+    /// axum) — the same identifier the e2b SDK receives from create and
+    /// passes to `delete_snapshot`.
+    #[tokio::test]
+    async fn delete_template_routes_snapshot_alias_to_snapshot_delete() {
+        use axum::{
+            extract::{Path, State},
+            routing::{delete, get},
+            Json, Router,
+        };
+        use serde_json::{json, Value};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let paths: Arc<Mutex<Vec<String>>> = Arc::default();
+        let paths_handler = Arc::clone(&paths);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock CubeMaster listener should bind");
+        let address = listener.local_addr().expect("mock CubeMaster address");
+        tokio::spawn(async move {
+            async fn get_snapshot(
+                Path(snapshot_id): Path<String>,
+                State(paths): State<Arc<Mutex<Vec<String>>>>,
+            ) -> Json<Value> {
+                paths
+                    .lock()
+                    .await
+                    .push(format!("GET /cube/snapshot/{snapshot_id}"));
+                json!({
+                    "RequestID": "req-get",
+                    "ret": { "ret_code": 0, "ret_msg": "success" },
+                    "snapshot": { "snapshot_id": "snap-1", "status": "READY" }
+                })
+                .into()
+            }
+
+            async fn delete_snapshot(
+                Path(snapshot_id): Path<String>,
+                State(paths): State<Arc<Mutex<Vec<String>>>>,
+            ) -> Json<Value> {
+                paths
+                    .lock()
+                    .await
+                    .push(format!("DELETE /cube/snapshot/{snapshot_id}"));
+                json!({
+                    "RequestID": "req-del",
+                    "ret": { "ret_code": 0, "ret_msg": "success" },
+                    "snapshot_id": "snap-1",
+                    "operation_id": "op-9",
+                    "status": "READY",
+                    "operation": { "operation_id": "op-9", "status": "READY" }
+                })
+                .into()
+            }
+
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/cube/snapshot/:snapshot_id", get(get_snapshot))
+                    .route("/cube/snapshot/:snapshot_id", delete(delete_snapshot))
+                    .with_state(paths_handler),
+            )
+            .await
+            .expect("mock CubeMaster server should run");
+        });
+
+        let mut config = ServerConfig::default();
+        config.cubemaster_url = format!("http://{address}");
+        let state = AppState::new(config, arc(NoopLogger)).await;
+        let server = TestServer::new(build_router(state)).expect("router should build");
+
+        let resp = server.delete("/templates/foo%3Adefault").await;
+
+        assert_eq!(resp.status_code(), StatusCode::NO_CONTENT);
+        let paths = paths.lock().await;
+        assert_eq!(
+            paths.as_slice(),
+            [
+                "GET /cube/snapshot/foo:default".to_string(),
+                "DELETE /cube/snapshot/foo:default".to_string()
+            ],
+            "the alias key must reach master verbatim on both calls"
+        );
+    }
+
     #[tokio::test]
     async fn removes_cluster_routes_from_root_surface() {
         let server = test_server().await;

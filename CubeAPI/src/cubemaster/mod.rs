@@ -271,7 +271,7 @@ impl CubeMasterClient {
         snapshot_id: &str,
         include_request: bool,
     ) -> Result<SnapshotDetailResponse, CubeMasterError> {
-        validate_path_segment("snapshot_id", snapshot_id)?;
+        validate_snapshot_identifier("snapshot_id", snapshot_id)?;
         let url = format!("{}/cube/snapshot/{}", self.base_url, snapshot_id);
         let mut builder = self.inner.get(&url);
         if include_request {
@@ -287,7 +287,7 @@ impl CubeMasterClient {
         snapshot_id: &str,
         req: &DeleteSnapshotRequest,
     ) -> Result<DeleteSnapshotResponse, CubeMasterError> {
-        validate_path_segment("snapshot_id", snapshot_id)?;
+        validate_snapshot_identifier("snapshot_id", snapshot_id)?;
         let url = format!("{}/cube/snapshot/{}", self.base_url, snapshot_id);
         let resp = self
             .inner
@@ -623,6 +623,7 @@ impl CubeMasterError {
 ///   as a potential source of routing ambiguity;
 /// * `.` and `..` are reserved for relative path resolution and easily slip
 ///   through naive equality checks.
+
 pub(crate) fn validate_path_segment(
     name: &'static str,
     value: &str,
@@ -631,6 +632,33 @@ pub(crate) fn validate_path_segment(
         && value
             .bytes()
             .all(|b| b == b'-' || b.is_ascii_alphanumeric());
+
+    if is_valid {
+        Ok(())
+    } else {
+        Err(CubeMasterError::InvalidPathParameter {
+            name,
+            value: value.to_string(),
+        })
+    }
+}
+
+/// Snapshot identifiers may be alias keys ("alias:tag"). Unlike generated
+/// resource IDs they legitimately contain ':' (the tag separator master
+/// resolves), so the generic `validate_path_segment` — which rejects ':' for
+/// its scheme/port ambiguity concern — cannot be reused. The charset stays a
+/// strict whitelist (`[a-z0-9-:]`), so every URL-significant character
+/// ('/', '%', '?', '#', '&', '+', space) is still rejected and the value can
+/// never alter the URL structure of the request.
+pub(crate) fn validate_snapshot_identifier(
+    name: &'static str,
+    value: &str,
+) -> Result<(), CubeMasterError> {
+    let is_valid = !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b == b'-' || b == b':' || b.is_ascii_alphanumeric());
 
     if is_valid {
         Ok(())
@@ -1592,6 +1620,11 @@ pub struct CreateSnapshotRequest {
     pub sandbox_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// Qualified alias key ("alias:tag") claimed by this snapshot. Parsed
+    /// from the E2B `name` by CubeAPI (namespace stripped, tag defaulted to
+    /// "default"); master validates and enforces uniqueness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
     pub create_request: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
@@ -1606,6 +1639,10 @@ pub struct SnapshotResource {
     pub names: Vec<String>,
     #[serde(default)]
     pub display_name: String,
+    /// Qualified alias key ("alias:tag") when the snapshot claimed one;
+    /// empty otherwise. CubeAPI surfaces it as the E2B `snapshotID`.
+    #[serde(default)]
+    pub alias: String,
     #[serde(default)]
     pub status: String,
     #[serde(default)]

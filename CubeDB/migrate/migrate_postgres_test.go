@@ -156,9 +156,11 @@ func assertPGHeadSchema(t *testing.T, db *sql.DB) {
 			columns: []string{
 				"snapshot_id", "origin_sandbox_id", "origin_node_id",
 				"backend", "remote_status", "request_json", "export_uuids",
+				"alias",
 			},
 			indexes: []string{
 				"uniq_cube_snapshot_id",
+				"uniq_cube_snapshot_alias",
 				"idx_cube_snapshot_origin_sandbox",
 				"idx_cube_snapshot_backend",
 			},
