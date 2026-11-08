@@ -40,6 +40,12 @@ func checkAndGetReqResource(req *types.CreateCubeSandboxReq) (*selctx.RequestRes
 
 	res.Cpu = cpu
 	res.Mem = mem
+	if len(req.Annotations) > 0 {
+		res.Annotations = make(map[string]string, len(req.Annotations))
+		for k, v := range req.Annotations {
+			res.Annotations[k] = v
+		}
+	}
 
 	if req.Annotations[constants.CubeAnnotationsSystemDiskSize] != "" {
 		var err error

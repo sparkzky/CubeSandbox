@@ -196,6 +196,22 @@ deployment (RTX 3060, driver 615.71):
   (`INVALID_HANDLE`/`INVALID_CONTEXT`). A Cubelet quarantine hook is still
   absent for genuine cleanup failures.
 
+### GPU-aware scheduling (P2, non-MIG)
+
+* **Cubelet** discovers GPUs (`nvidia-smi`), owns the node-local reservation
+  state machine (`Allocatable/Reserved/Attached/Releasing/Quarantined`),
+  enforces `memory_quota_mb`, per-card session caps and
+  `required_driver_min`/`models` compatibility, and reports inventory via
+  node labels `cube.gpu.*` on every heartbeat.
+* **CubeMaster** has a `gpu` scheduler filter: requests with
+  `cube.gpu` (JSON or bare `true`) are placed only on nodes with enough free
+  GPU memory, session slots, matching driver and models. Non-GPU sandboxes are
+  unaffected.
+* Validated on the real deployment: two 5120 MiB sandboxes fit a 12288 MiB
+  card, the third is rejected, a 1536 MiB sandbox still fits, non-GPU
+  sandboxes keep scheduling while the GPU is full, incompatible
+  driver/model requests are rejected, and capacity is reusable after teardown.
+
 ## Known limitations
 
 * Async memory operations (`cuMemcpy*Async`, `cuMemAllocAsync`) complete

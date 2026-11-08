@@ -42,6 +42,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/container/rootfs"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/container/runc"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/container/virtiofs"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/gpu"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 	cubeboxstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/taskio"
@@ -370,6 +371,12 @@ func (l *local) Init(ctx context.Context, opts *workflow.InitInfo) error {
 	}
 
 	taskio.Init(taskio.FIFODir(l.config.StatePath))
+
+	// InitHost wipes local sandbox state above, so no GPU reservation can
+	// survive a restart; rebuild the ledger before inventory is reported.
+	if mgr := gpu.Default(); mgr != nil {
+		mgr.Reconcile(nil)
+	}
 	return nil
 }
 

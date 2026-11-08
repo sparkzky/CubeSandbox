@@ -21,6 +21,7 @@ import (
 	cubeletnodemeta "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/cubelet/nodemeta"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/cubelet/nodestatus"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/cubelet/resourcesource"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/gpu"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/masterclient"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/networkagentclient"
 	corev1 "k8s.io/api/core/v1"
@@ -384,7 +385,8 @@ func (kl *Cubelet) updateNode(ctx context.Context, originalNode *cubeletnodemeta
 		areRequiredLabelsNotPresent = true
 	}
 	kl.setNodeStatus(ctx, node)
-	changed := nodeStatusHasChanged(&originalNode.Status, &node.Status) || areRequiredLabelsNotPresent
+	labelChanged := applyGpuLabels(node)
+	changed := nodeStatusHasChanged(&originalNode.Status, &node.Status) || areRequiredLabelsNotPresent || labelChanged
 	return node, changed
 }
 
@@ -532,6 +534,7 @@ func (kl *Cubelet) buildStatusRequest(node *cubeletnodemeta.Node) *masterclient.
 		Conditions:     append([]corev1.NodeCondition(nil), node.Status.Conditions...),
 		Images:         append([]cubeletnodemeta.ContainerImage(nil), node.Status.CubeImages...),
 		LocalTemplates: append([]cubeletnodemeta.LocalTemplate(nil), node.Status.CubeTemplates...),
+		Labels:         cloneLabels(node.Labels),
 		HeartbeatTime:  kl.clock.Now(),
 	}
 	attachResourceReport(req, kl.clock.Now())
@@ -625,6 +628,46 @@ func applyHostQuotaWithConfig(node *cubeletnodemeta.Node, hostCfg *config.HostCo
 		node.Status.Capacity[corev1.ResourceMemory] = q.DeepCopy()
 		node.Status.Allocatable[corev1.ResourceMemory] = q.DeepCopy()
 	}
+	applyGpuLabels(node)
+}
+
+// applyGpuLabels refreshes the node-label view of the GPU inventory. Labels
+// under gpu.LabelPrefix that are no longer reported are removed, so a card
+// disappearing (or the feature being disabled) cannot leave stale inventory
+// behind. The bool reports whether anything changed, which lets the heartbeat
+// loop patch immediately after a placement change.
+func applyGpuLabels(node *cubeletnodemeta.Node) bool {
+	if node == nil {
+		return false
+	}
+	mgr := gpu.Default()
+	if mgr == nil {
+		return false
+	}
+	desired := mgr.Labels()
+	if node.Labels == nil {
+		if len(desired) == 0 {
+			return false
+		}
+		node.Labels = make(map[string]string, len(desired))
+	}
+	changed := false
+	for key, value := range desired {
+		if node.Labels[key] != value {
+			node.Labels[key] = value
+			changed = true
+		}
+	}
+	for key := range node.Labels {
+		if !strings.HasPrefix(key, gpu.LabelPrefix) {
+			continue
+		}
+		if _, ok := desired[key]; !ok {
+			delete(node.Labels, key)
+			changed = true
+		}
+	}
+	return changed
 }
 
 func resolveHostQuotaCPUMilli(hostCfg *config.HostConf, fallbacks ...int64) int64 {

@@ -57,7 +57,11 @@ type UpdateNodeStatusRequest struct {
 	Conditions     []corev1.NodeCondition           `json:"conditions,omitempty"`
 	Images         []cubeletnodemeta.ContainerImage `json:"images,omitempty"`
 	LocalTemplates []cubeletnodemeta.LocalTemplate  `json:"local_templates,omitempty"`
-	HeartbeatTime  time.Time                        `json:"heartbeat_time,omitempty"`
+	// Labels carries the current node labels (including the cube.gpu.*
+	// inventory) so properties that change at runtime are refreshed with
+	// every heartbeat, not only at registration time.
+	Labels        map[string]string `json:"labels,omitempty"`
+	HeartbeatTime time.Time         `json:"heartbeat_time,omitempty"`
 
 	Allocated  *AllocatedResources `json:"allocated,omitempty"`
 	DiskUsage  *DiskUsage          `json:"disk_usage,omitempty"`

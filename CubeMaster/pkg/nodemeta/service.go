@@ -80,6 +80,10 @@ type RegisterNodeRequest struct {
 
 type UpdateNodeStatusRequest struct {
 	RequestID      string                 `json:"requestID,omitempty"`
+	// Labels carries runtime node labels (e.g. cube.gpu.* inventory) that
+	// change between heartbeats. They are merged into the node metadata and
+	// refreshed in the scheduler cache.
+	Labels         map[string]string      `json:"labels,omitempty"`
 	Conditions     []corev1.NodeCondition `json:"conditions,omitempty"`
 	Images         []ContainerImage       `json:"images,omitempty"`
 	LocalTemplates []LocalTemplate        `json:"local_templates,omitempty"`
@@ -307,7 +311,28 @@ func UpdateNodeStatus(ctx context.Context, nodeID string, req *UpdateNodeStatusR
 	snap.HeartbeatTime = req.HeartbeatTime
 	snap.ReportedReady = reportedReady
 	applyCurrentHealth(snap, time.Now())
+	labelsChanged := false
+	if len(req.Labels) > 0 {
+		if snap.Labels == nil {
+			snap.Labels = make(map[string]string, len(req.Labels))
+		}
+		for k, v := range req.Labels {
+			if snap.Labels[k] != v {
+				snap.Labels[k] = v
+				labelsChanged = true
+			}
+		}
+	}
+	var mergedLabels map[string]string
+	if labelsChanged {
+		mergedLabels = cloneStringMap(snap.Labels)
+	}
 	global.mu.Unlock()
+	if labelsChanged {
+		if err := mergeNodeLabelsIntoDB(nodeID, mergedLabels); err != nil {
+			log.G(ctx).Warnf("merge runtime node labels failed for %s: %v", nodeID, err)
+		}
+	}
 	syncLocalcache(snap)
 
 	// Resource metrics flow via Redis (shared across cubemaster replicas)
@@ -552,6 +577,32 @@ func ListSchedulerNodes(ctx context.Context) ([]*node.Node, error) {
 
 type UpdateNodeLabelsRequest struct {
 	Labels map[string]string `json:"labels"`
+}
+
+// mergeNodeLabelsIntoDB merges labels into the node registration row without
+// touching the in-process snapshot (the status-update path already updated it).
+func mergeNodeLabelsIntoDB(nodeID string, labels map[string]string) error {
+	if len(labels) == 0 {
+		return nil
+	}
+	return global.db.Transaction(func(tx *gorm.DB) error {
+		existing, err := readLabelsJSONForUpdate(tx, nodeID)
+		if err != nil {
+			return err
+		}
+		for k, v := range labels {
+			existing[k] = v
+		}
+		if len(existing) > maxLabelsPerNode {
+			return fmt.Errorf("a node cannot have more than %d labels, got %d after merge", maxLabelsPerNode, len(existing))
+		}
+		return tx.Table(constants.NodeMetaRegistrationTable).
+			Where("node_id = ?", nodeID).
+			Updates(map[string]interface{}{
+				"labels_json": mustJSON(existing),
+				"updated_at":  time.Now(),
+			}).Error
+	})
 }
 
 func UpdateNodeLabels(ctx context.Context, nodeID string, labels map[string]string) error {

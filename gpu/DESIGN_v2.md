@@ -251,3 +251,42 @@ P0/P1 在现分支迭代；P2 起拆分支；P4 前先在 Discussion #174 评论
 为此修复了宿主栈上的真实缺口：CubeAPI/CubeMaster 注解透传、shim restore 路径传递 IVSHMEM、VMM 恢复时允许新增设备、IVSHMEM BAR2 重编程时迁移 KVM slot、guest 库自动 PCI rescan、guest 库消除 GLIBC_2.38 依赖。
 
 缺口修复：共享内存全局头新增 `memory_quota`，guest 库在 env 缺失时从头部读取 `session_id`/token/quota（零配置引导，已用空环境验证）；daemon 监听 `CUBE_GPU_VM_DIR`（默认 `/run/vc/vm`）下每个沙箱的 `cube.sock_<guest_port>`，原生接入 VMM 的 Unix vsock 代理（不再需要桥接）。
+
+---
+
+## 13. P2 实现状态（非 MIG 部分，2026-11）
+
+按 §9 P2 完成除 MIG 后端外的能力：
+
+### Cubelet GPU 资源管理（`Cubelet/pkg/gpu`）
+
+- 发现：`nvidia-smi --query-gpu=...`（可注入 runner）；启动时执行一次，失败不阻断 Cubelet。
+- 状态机：`Allocatable → Reserved (create 前) → Attached (create 成功) → Releasing → Allocatable`；teardown 失败进入 `Quarantined`，容量保持占用直到成功释放或重启。
+- 选择策略：binpack（剩余显存最多的卡）；约束 free ≥ quota 且该卡 sessions < `max_sessions_per_gpu`（默认 64）。
+- 兼容性：`required_driver_min`（按数字段比较）与 `models`（大小写不敏感子串匹配）在 Reserve 时校验，失败明确报错。
+- 接入：`services/cubebox` 的 Create（Reserve/Attach/失败 Release）与 Destroy（成功 Release/失败 Quarantine）；`local.Init` 时 `Reconcile(nil)`。
+- 上报：节点 labels `cube.gpu.present/count/memory.total.mib/memory.used.mib/sessions/max.sessions/driver/models`，注册与每次心跳刷新；CubeMaster 状态更新合并并持久化这些 labels。
+
+### CubeMaster GPU 调度（`pkg/selector/filter/gpufilter.go`）
+
+- `RequestResource.Annotations` 从请求注解填充；`gpu` 过滤器按契约校验容量、sessions、驱动版本、型号；注解支持 JSON 与裸布尔；解析失败保守拒绝。
+- 过滤器注册进 `FilterInitializers`；GPU 请求失败时不回退 BackoffSelect，避免绕过约束。
+
+### 验证（真实部署）
+
+| 场景 | 结果 |
+|---|---|
+| 节点库存 labels | count=1, total=12288MiB, used=0, sessions=0, driver=615.71.09, model=RTX 3060 |
+| 2×5120MiB 并存 | 成功；labels used=10240/sessions=2 |
+| 第 3 个 5120MiB | 调度拒绝（130597 no resource） |
+| 1536MiB（剩余 2048） | 成功；used=11776/sessions=3 |
+| GPU 满载时创建非 GPU 沙箱 | 成功（不受影响） |
+| required_driver_min=999 / models=[A100] | 拒绝；正确型号允许 |
+| 删除后复用 | labels 归零；再次 5120MiB 成功 |
+| 运行时 | 零配置 GPU 沙箱内 e2e_main 17/17 |
+| 裸布尔注解 `"true"` | 成功，默认 4096MiB |
+
+### 未包含（按约定排除）
+
+- MIG 后端与实例级 daemon（P2 中 MIG 部分）。
+- 已知限制：GPU 发现仅在启动时；labels 经心跳传播存在秒级陈旧窗口；调度拒绝统一表现为 no-resource；GPU 沙箱的 pause/snapshot 未做特殊处理。

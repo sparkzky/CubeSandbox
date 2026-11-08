@@ -44,6 +44,11 @@ func Select(selCtx *selctx.SelectorCtx) (nodes *node.Node, err error) {
 		if shouldSkipBackoffForTemplate(selCtx) {
 			return nil, err
 		}
+		if selCtx != nil && filter.RequestNeedsGPU(selCtx.ReqRes) {
+			// Backoff selection ignores GPU inventory; falling back here would
+			// silently place a GPU sandbox on an ineligible node.
+			return nil, err
+		}
 
 		log.G(selCtx.Ctx).Errorf("scheduler_Select fail,try BackoffSelect")
 		return BackoffSelect(selCtx)

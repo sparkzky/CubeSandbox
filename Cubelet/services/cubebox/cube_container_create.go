@@ -109,9 +109,22 @@ func (l *local) Create(ctx context.Context, opts *workflow.CreateContext) error 
 			return ret.Err(errorcode.ErrorCode_PreConditionFailed, "already exists")
 		}
 	}
+	gpuReserved, err := reserveSandboxGPU(ctx, opts.SandboxID, realReq.GetAnnotations())
+	if err != nil {
+		return err
+	}
+
 	opts.CubeBoxCreated = true
 	if err := l.createContainers(ctx, opts); err != nil {
+		if gpuReserved {
+			releaseSandboxGPU(ctx, opts.SandboxID, "create failed")
+		}
 		return err
+	}
+	if gpuReserved {
+		if err := attachSandboxGPU(ctx, opts.SandboxID); err != nil {
+			return err
+		}
 	}
 	cgInfo, ok := opts.CgroupInfo.(*cgroupp.Info)
 	if ok {

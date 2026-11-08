@@ -152,6 +152,12 @@ func init() {
 			// pick it up without taking a hard dependency on this package.
 			resourcesource.Set(cb)
 
+			// Build the node-level GPU manager once for the process. It is
+			// shared by the create/destroy paths and the heartbeat label
+			// reporter, and a discovery failure only degrades the node to
+			// "no GPU" instead of blocking startup.
+			initGPUManager()
+
 			go func() {
 				CubeLog.Info("Start subscribing containerd event")
 				s.eventMonitor.subscribe(s.events)

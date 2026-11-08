@@ -45,6 +45,16 @@ func (l *local) Destroy(ctx context.Context, opts *workflow.DestroyContext) (err
 	}
 
 	sandBoxID := opts.SandboxID
+	// Only give the reservation back once teardown succeeded; a failed
+	// destroy quarantines the allocation so the node does not oversell GPU
+	// memory for a sandbox that may still be running.
+	defer func() {
+		if err == nil {
+			releaseSandboxGPU(ctx, sandBoxID, "destroy")
+			return
+		}
+		quarantineSandboxGPU(ctx, sandBoxID, err)
+	}()
 	defer func() {
 
 		if err == nil {

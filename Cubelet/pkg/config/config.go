@@ -21,6 +21,10 @@ import (
 
 var cfg *Config
 
+// defaultMaxSessionsPerGPU mirrors gpu.DefaultMaxSessionsPerGPU without
+// coupling the config package to the allocator.
+const defaultMaxSessionsPerGPU = 64
+
 var networkAgentOverride struct {
 	enable   bool
 	endpoint string
@@ -43,6 +47,18 @@ type HostConf struct {
 	Quota          HostConfigQuota `yaml:"quota"`
 	GC             HostConfigGC    `yaml:"gc"`
 	SchedulerLabel string          `yaml:"scheduler_label"`
+	GPU            HostGPUConf     `yaml:"gpu"`
+}
+
+// HostGPUConf controls node-level GPU inventory and placement.
+type HostGPUConf struct {
+	// Enabled turns on GPU discovery, admission control and inventory
+	// reporting. Leaving it false keeps GPU-annotated sandboxes out of the
+	// scheduler's reach even if cards are physically present.
+	Enabled bool `yaml:"enabled"`
+	// MaxSessionsPerGPU caps how many sandboxes may share one physical card.
+	// Values <= 0 fall back to the default (64).
+	MaxSessionsPerGPU int `yaml:"max_sessions_per_gpu"`
 }
 
 type HostConfigQuota struct {
@@ -219,6 +235,9 @@ func preHandle(config *Config) (*Config, error) {
 	}
 	if config.HostConf.GC.ImageExpirationTime == "" {
 		config.HostConf.GC.ImageExpirationTime = "24h"
+	}
+	if config.HostConf.GPU.MaxSessionsPerGPU <= 0 {
+		config.HostConf.GPU.MaxSessionsPerGPU = defaultMaxSessionsPerGPU
 	}
 	if config.Common.CommonTimeout == time.Duration(0) {
 		config.Common.CommonTimeout = 10 * time.Second

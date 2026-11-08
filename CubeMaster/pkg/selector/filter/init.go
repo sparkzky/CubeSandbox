@@ -44,4 +44,5 @@ var filters = map[string]interface{}{
 	"realtime_create_num": NewRealtimecreatelimit,
 	"disk":                NewDiskFilter,
 	"thirtparty":          NewThirtpartyFilter,
+	"gpu":                 NewGpuFilter,
 }

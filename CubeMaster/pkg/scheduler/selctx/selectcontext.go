@@ -47,6 +47,10 @@ type RequestResource struct {
 	TemplateID             string
 	TemplateNodeScope      []string
 	EnforceSnapshotStorage bool
+
+	// Annotations carries the sandbox request annotations to placement
+	// filters (e.g. cube.gpu for GPU-aware scheduling).
+	Annotations map[string]string
 }
 
 type ImageSpec struct {
