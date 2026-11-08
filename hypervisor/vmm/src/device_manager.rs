@@ -792,6 +792,38 @@ impl DeviceRelocation for AddressManager {
             }
         }
 
+        // IVSHMEM BAR2 is backed by a KVM userspace memory region created at
+        // the initial BAR address. When the guest reprograms the BAR (e.g. a
+        // PCI rescan on snapshot restore), the slot must move with it,
+        // otherwise guest accesses fall into the device MMIO handler instead
+        // of the shared memory.
+        if let Some(iv) = any_dev.downcast_mut::<devices::IvshmemDevice>() {
+            if iv.region_base() == old_base && iv.region_host_addr().is_some() {
+                if let (Some(slot), Some(host_addr)) = (iv.mem_slot(), iv.region_host_addr()) {
+                    let len = iv.region_len();
+                    let old_region = self.vm.make_user_memory_region(
+                        slot, old_base, len, host_addr, false, false,
+                    );
+                    self.vm.remove_user_memory_region(old_region).map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("failed to remove ivshmem user memory region: {:?}", e),
+                        )
+                    })?;
+                    let new_region = self.vm.make_user_memory_region(
+                        slot, new_base, len, host_addr, false, false,
+                    );
+                    self.vm.create_user_memory_region(new_region).map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("failed to create ivshmem user memory region: {:?}", e),
+                        )
+                    })?;
+                    iv.set_region_base(new_base);
+                }
+            }
+        }
+
         pci_dev.move_bar(old_base, new_base)
     }
 }
@@ -3839,6 +3871,7 @@ impl DeviceManager {
                 false,
             )
             .map_err(DeviceManagerError::MemoryManager)?;
+        ivshmem_device.lock().unwrap().set_mem_slot(mem_slot);
         // Make ivshmem/zshm BAR2 visible through device_memory so that virtio
         // backends and DMA-mapping helpers can dereference GPAs that fall
         // inside this BAR.
@@ -4488,10 +4521,14 @@ impl DeviceManager {
                                 Ok(())
                             }));
                         } else {
-                            return Err(MigratableError::Restore(anyhow!(
-                                "Missing device {}",
+                            // Newly attached device (e.g. IVSHMEM for GPU
+                            // sharing added on the restore path): there is no
+                            // snapshot state for it, so keep the freshly
+                            // created device instead of failing the restore.
+                            warn!(
+                                "Device {} missing from snapshot; treating as newly created",
                                 node.id
-                            )));
+                            );
                         }
                     }
                 }

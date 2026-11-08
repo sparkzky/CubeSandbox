@@ -16,7 +16,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use vm_allocator::{AddressAllocator, SystemAllocator};
 use vm_device::{BusDevice, Resource};
 use vm_memory::bitmap::AtomicBitmap;
-use vm_memory::{Address, GuestAddress};
+use vm_memory::{Address, GuestAddress, GuestMemoryRegion};
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 
 const IVSHMEM_BAR0_IDX: usize = 0;
@@ -81,6 +81,10 @@ pub struct IvshmemDevice {
 
     region: Option<Arc<GuestRegionMmap>>,
     region_size: u64,
+    // KVM memory slot backing BAR2 (moved when the BAR is reprogrammed).
+    mem_slot: Option<u32>,
+    // Current guest-physical base of the shared memory region.
+    region_base: u64,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -117,6 +121,8 @@ impl IvshmemDevice {
                 doorbell: s.doorbell,
                 region_size,
                 region: None,
+                mem_slot: None,
+                region_base: 0,
             }
         } else {
             IvshmemDevice {
@@ -129,6 +135,8 @@ impl IvshmemDevice {
                 doorbell: 0,
                 region_size,
                 region: None,
+                mem_slot: None,
+                region_base: 0,
             }
         }
     }
@@ -142,7 +150,32 @@ impl IvshmemDevice {
     }
 
     pub fn assign_region(&mut self, region: Arc<GuestRegionMmap>) {
+        self.region_base = region.start_addr().0;
         self.region = Some(region);
+    }
+
+    pub fn region_base(&self) -> u64 {
+        self.region_base
+    }
+
+    pub fn set_region_base(&mut self, base: u64) {
+        self.region_base = base;
+    }
+
+    pub fn set_mem_slot(&mut self, slot: u32) {
+        self.mem_slot = Some(slot);
+    }
+
+    pub fn mem_slot(&self) -> Option<u32> {
+        self.mem_slot
+    }
+
+    pub fn region_host_addr(&self) -> Option<u64> {
+        self.region.as_ref().map(|r| r.as_ptr() as u64)
+    }
+
+    pub fn region_len(&self) -> u64 {
+        self.region_size as u64
     }
 
     fn state(&self) -> IvshmemDeviceState {

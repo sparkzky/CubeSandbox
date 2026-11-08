@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use super::device::{self, Device, DeviceDisk};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(from = "GpuConfigRepr")]
 pub struct GpuConfig {
     #[serde(default)]
     pub enable: bool,
@@ -23,6 +24,50 @@ pub struct GpuConfig {
     pub memory_quota_mb: u64,
     #[serde(default)]
     pub vsock_port: u32,
+    /// Optional SM (streaming multiprocessor) share for this sandbox, in
+    /// percent, forwarded to the daemon via `CUBE_GPU_SM_PERCENT`.
+    #[serde(default)]
+    pub sm_percent: Option<u64>,
+}
+
+/// The `cube.gpu` annotation historically accepted a bare boolean as well as
+/// the full object form. Keep both spellings working.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum GpuConfigRepr {
+    Enabled(bool),
+    Detailed {
+        #[serde(default)]
+        enable: bool,
+        #[serde(default = "default_gpu_memory_quota")]
+        memory_quota_mb: u64,
+        #[serde(default)]
+        vsock_port: u32,
+        #[serde(default)]
+        sm_percent: Option<u64>,
+    },
+}
+
+impl From<GpuConfigRepr> for GpuConfig {
+    fn from(repr: GpuConfigRepr) -> Self {
+        match repr {
+            GpuConfigRepr::Enabled(enable) => GpuConfig {
+                enable,
+                ..GpuConfig::default()
+            },
+            GpuConfigRepr::Detailed {
+                enable,
+                memory_quota_mb,
+                vsock_port,
+                sm_percent,
+            } => GpuConfig {
+                enable,
+                memory_quota_mb,
+                vsock_port,
+                sm_percent,
+            },
+        }
+    }
 }
 
 fn default_gpu_memory_quota() -> u64 {

@@ -680,6 +680,12 @@ func checkAndGetAnnotation(req *types.CreateCubeSandboxReq, out *cubebox.RunCube
 		}
 	}
 
+	// GPU request annotation is not under the cube.master prefix but must
+	// reach Cubelet (which forwards it to CubeShim's OCI spec annotations).
+	if v, ok := req.Annotations[constants.AnnotationsGPU]; ok {
+		out.Annotations[constants.AnnotationsGPU] = v
+	}
+
 	out.Annotations[constants.CubeAnnotationsUseNetFileCache] = "true"
 
 	if v, ok := req.Annotations[constants.CubeAnnotationsInsRegion]; !ok || v == "" {

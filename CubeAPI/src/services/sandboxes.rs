@@ -27,6 +27,10 @@ const RET_CODE_HTTP_OK: i32 = 200;
 const RET_CODE_NOT_FOUND: i32 = 130404;
 const RET_CODE_CONFLICT: i32 = 130409;
 const HOSTDIR_MOUNT_KEY: &str = "host-mount";
+/// Metadata key promoted verbatim to a sandbox annotation. Cubelet interprets
+/// the annotation value as the GPU request for the sandbox (shim-side support);
+/// the API only forwards it and does not validate the payload.
+const GPU_ANNOTATION_KEY: &str = "cube.gpu";
 const ENV_VAR_NAME_MAX_LEN: usize = 256;
 const ENV_VAR_VALUE_MAX_LEN: usize = 4096;
 
@@ -172,6 +176,9 @@ impl SandboxService {
         let labels = metadata.map(|mut meta| {
             if let Some(value) = meta.remove(HOSTDIR_MOUNT_KEY) {
                 annotations.insert(HOSTDIR_MOUNT_KEY.to_string(), value);
+            }
+            if let Some(value) = meta.remove(GPU_ANNOTATION_KEY) {
+                annotations.insert(GPU_ANNOTATION_KEY.to_string(), value);
             }
             meta
         });

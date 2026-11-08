@@ -24,7 +24,7 @@ use containerd_shim::protos::events::task::TaskOOM;
 use containerd_shim::protos::protobuf::MessageDyn;
 use containerd_shim::{Error, Result};
 use cube_hypervisor::config::RestoreConfig;
-use cube_hypervisor::vm_config::{DeviceConfig, FsConfig};
+use cube_hypervisor::vm_config::{DeviceConfig, FsConfig, IvshmemConfig};
 use cube_hypervisor::{SnapshotType, VmRemoveDeviceData};
 use oci_spec::runtime::{LinuxResources, Process, Spec};
 use protoc::{agent, agent_ttrpc, health, health_ttrpc};
@@ -898,6 +898,27 @@ impl SandBox {
         let pmems = Utils::restore_pmems_config(&self.conf.pmem);
         let vsock = Utils::gen_vsock_config(&self.id);
 
+        // GPU sharing: the snapshot was taken without an IVSHMEM device, so
+        // attach the per-sandbox backing file on the restore path as well.
+        let ivshmem = match GpuIntegration::from_config(&self.conf.gpu) {
+            Some(gpu_int) => {
+                let sandbox_id_hash = {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    self.id.hash(&mut hasher);
+                    hasher.finish()
+                };
+                let shm_path = gpu_int
+                    .ensure_backing_file(sandbox_id_hash)
+                    .map_err(|e| format!("failed to create ivshmem backing file: {}", e))?;
+                Some(IvshmemConfig {
+                    path: PathBuf::from(shm_path),
+                    size: (gpu_int.shm_size_mb as usize) << 20,
+                })
+            }
+            None => None,
+        };
+
         let ch = self.ch.as_mut().unwrap().lock().await;
         let config = RestoreConfig {
             source_url: PathBuf::from(snapshot),
@@ -905,6 +926,7 @@ impl SandBox {
             net: Some(nets),
             disks: Some(disks),
             pmem: Some(pmems),
+            ivshmem,
             vsock: Some(vsock),
             memory_vol_url: restore_memory_vol_url,
             ..Default::default()

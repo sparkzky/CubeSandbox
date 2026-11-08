@@ -1,41 +1,76 @@
 // Copyright (c) 2024 Tencent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use libloading::{Library, Symbol};
-use tracing::{info, error};
-use std::path::Path;
+//! Thin libloading bindings over the real CUDA driver (`libcuda.so.1`).
+//!
+//! Every wrapper returns `CuResult` (`u32`) instead of panicking: a missing
+//! symbol maps to `CUDA_ERROR_NOT_SUPPORTED`, never to a process abort.  All
+//! context/handle types are represented as `u64` (pointer width on 64-bit);
+//! `CUdevice` is an `int`.
 
-type CuResult = u32;
+use libloading::{Library, Symbol};
+use std::ffi::c_void;
+use tracing::info;
+
+use crate::vsock_listener::{CUDA_ERROR_INVALID_VALUE, CUDA_ERROR_NOT_SUPPORTED, CUDA_SUCCESS};
+
+pub type CuResult = u32;
+
+/// `CUexecAffinityType` used with `cuCtxCreate_v3`.
+const CU_EXEC_AFFINITY_TYPE_SM_COUNT: u32 = 0;
+
+/// `CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`.
+pub const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 0x10;
+
+/// Mirror of CUDA's `CUexecAffinityParam` (enum followed by a union containing
+/// a single `unsigned int`), layout-compatible with the driver header.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CuExecAffinityParam {
+    pub affinity_type: u32,
+    pub sm_count: u32,
+}
 
 pub struct CudaRuntime {
     lib: Library,
     device_count: i32,
 }
 
+// The driver library is thread-safe; access from the daemon is additionally
+// serialized behind a mutex (CUcontext is per-thread state).
 unsafe impl Send for CudaRuntime {}
 unsafe impl Sync for CudaRuntime {}
 
 impl CudaRuntime {
     pub fn new() -> Result<Self, String> {
         let lib = unsafe {
-            Library::new("libcuda.so.1").map_err(|e| format!("Failed to load libcuda.so.1: {}", e))?
+            Library::new("libcuda.so.1")
+                .map_err(|e| format!("Failed to load libcuda.so.1: {}", e))?
         };
 
-        let mut count = 0i32;
-        unsafe {
-            let cu_init: Symbol<unsafe extern "C" fn(u32) -> CuResult> =
-                lib.get(b"cuInit\0").map_err(|e| format!("cuInit not found: {}", e))?;
-            cu_init(0);
-
-            let cu_device_get_count: Symbol<unsafe extern "C" fn(*mut i32) -> CuResult> =
-                lib.get(b"cuDeviceGetCount\0").map_err(|e| format!("cuDeviceGetCount not found: {}", e))?;
-
-            cu_device_get_count(&mut count);
-            info!("Found {} CUDA device(s)", count);
-
-            if count == 0 {
-                return Err("No CUDA devices found".to_string());
+        let count = unsafe {
+            let cu_init: Symbol<unsafe extern "C" fn(u32) -> CuResult> = lib
+                .get(b"cuInit\0")
+                .map_err(|e| format!("cuInit not found: {}", e))?;
+            let rc = cu_init(0);
+            if rc != CUDA_SUCCESS {
+                return Err(format!("cuInit failed: {}", rc));
             }
+
+            let cu_device_get_count: Symbol<unsafe extern "C" fn(*mut i32) -> CuResult> = lib
+                .get(b"cuDeviceGetCount\0")
+                .map_err(|e| format!("cuDeviceGetCount not found: {}", e))?;
+            let mut count: i32 = 0;
+            let rc = cu_device_get_count(&mut count);
+            if rc != CUDA_SUCCESS {
+                return Err(format!("cuDeviceGetCount failed: {}", rc));
+            }
+            count
+        };
+
+        info!("Found {} CUDA device(s)", count);
+        if count <= 0 {
+            return Err("No CUDA devices found".to_string());
         }
 
         Ok(Self {
@@ -48,206 +83,520 @@ impl CudaRuntime {
         self.device_count
     }
 
+    /// Resolve a driver symbol.  A missing entry point is a protocol-level
+    /// "feature unsupported", not a crash.
+    unsafe fn sym<T>(&self, name: &[u8]) -> Result<Symbol<'_, T>, CuResult> {
+        self.lib.get(name).map_err(|_| CUDA_ERROR_NOT_SUPPORTED)
+    }
+
+    // ── Memory ──────────────────────────────────────────────────────────
+
     pub fn mem_alloc(&self, size: u64) -> Result<u64, CuResult> {
         unsafe {
-            let cu_mem_alloc: Symbol<unsafe extern "C" fn(*mut u64, u64) -> CuResult> =
-                self.lib.get(b"cuMemAlloc_v2\0").unwrap();
-            let mut devptr: u64 = 0;
-            let result = cu_mem_alloc(&mut devptr, size);
-            if result == 0 { Ok(devptr) } else { Err(result) }
+            let f: Symbol<unsafe extern "C" fn(*mut u64, u64) -> CuResult> =
+                self.sym(b"cuMemAlloc_v2\0")?;
+            let mut ptr: u64 = 0;
+            let rc = f(&mut ptr, size);
+            if rc == CUDA_SUCCESS {
+                Ok(ptr)
+            } else {
+                Err(rc)
+            }
         }
     }
 
     pub fn mem_free(&self, devptr: u64) -> CuResult {
         unsafe {
-            let cu_mem_free: Symbol<unsafe extern "C" fn(u64) -> CuResult> =
-                self.lib.get(b"cuMemFree_v2\0").unwrap();
-            cu_mem_free(devptr)
+            match self.sym::<unsafe extern "C" fn(u64) -> CuResult>(b"cuMemFree_v2\0") {
+                Ok(f) => f(devptr),
+                Err(rc) => rc,
+            }
         }
     }
 
-    pub fn memcpy_h2d(&self, dst: u64, shm_offset: u64, size: u64, shm_base: *mut u8, shm_size: usize) -> CuResult {
-        if shm_base.is_null() { return 1; }
-        if shm_offset.checked_add(size).map_or(true, |end| end > shm_size as u64) { return 1; }
+    pub fn mem_alloc_async(&self, size: u64, stream: u64) -> Result<u64, CuResult> {
         unsafe {
-            let src_ptr = shm_base.offset(shm_offset as isize);
-            let cu_memcpy: Symbol<unsafe extern "C" fn(u64, *const std::ffi::c_void, u64) -> CuResult> =
-                self.lib.get(b"cuMemcpyHtoD_v2\0").unwrap();
-            cu_memcpy(dst, src_ptr as *const std::ffi::c_void, size)
+            let f: Symbol<unsafe extern "C" fn(*mut u64, u64, u64) -> CuResult> =
+                self.sym(b"cuMemAllocAsync\0")?;
+            let mut ptr: u64 = 0;
+            let rc = f(&mut ptr, size, stream);
+            if rc == CUDA_SUCCESS {
+                Ok(ptr)
+            } else {
+                Err(rc)
+            }
         }
     }
 
-    pub fn memcpy_h2d_via_shm(&self, dst: u64, shm_offset: u64, size: u64, shm_base: *mut u8, shm_size: usize) -> CuResult {
-        self.memcpy_h2d(dst, shm_offset, size, shm_base, shm_size)
+    pub fn mem_free_async(&self, devptr: u64, stream: u64) -> CuResult {
+        unsafe {
+            match self.sym::<unsafe extern "C" fn(u64, u64) -> CuResult>(b"cuMemFreeAsync\0") {
+                Ok(f) => f(devptr, stream),
+                Err(rc) => rc,
+            }
+        }
     }
 
-    pub fn memcpy_d2h(&self, shm_offset: u64, src: u64, size: u64, shm_base: *mut u8, shm_size: usize) -> CuResult {
-        if shm_base.is_null() { return 1; }
-        if shm_offset.checked_add(size).map_or(true, |end| end > shm_size as u64) { return 1; }
+    /// Host→device copy from a host buffer.
+    pub fn memcpy_h2d(&self, dst: u64, src: &[u8]) -> CuResult {
         unsafe {
-            let dst_ptr = shm_base.offset(shm_offset as isize);
-            let cu_memcpy: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void, u64, u64) -> CuResult> =
-                self.lib.get(b"cuMemcpyDtoH_v2\0").unwrap();
-            cu_memcpy(dst_ptr as *mut std::ffi::c_void, src, size)
+            let f: Symbol<unsafe extern "C" fn(u64, *const c_void, u64) -> CuResult> =
+                match self.sym(b"cuMemcpyHtoD_v2\0") {
+                    Ok(f) => f,
+                    Err(rc) => return rc,
+                };
+            f(dst, src.as_ptr() as *const c_void, src.len() as u64)
+        }
+    }
+
+    /// Device→host copy into a host buffer.
+    pub fn memcpy_d2h(&self, dst: &mut [u8], src: u64) -> CuResult {
+        unsafe {
+            let f: Symbol<unsafe extern "C" fn(*mut c_void, u64, u64) -> CuResult> =
+                match self.sym(b"cuMemcpyDtoH_v2\0") {
+                    Ok(f) => f,
+                    Err(rc) => return rc,
+                };
+            f(dst.as_mut_ptr() as *mut c_void, src, dst.len() as u64)
         }
     }
 
     pub fn memcpy_d2d(&self, dst: u64, src: u64, size: u64) -> CuResult {
         unsafe {
-            let cu_memcpy: Symbol<unsafe extern "C" fn(u64, u64, u64) -> CuResult> =
-                self.lib.get(b"cuMemcpy_v2\0").unwrap();
-            cu_memcpy(dst, src, size)
+            match self.sym::<unsafe extern "C" fn(u64, u64, u64) -> CuResult>(b"cuMemcpyDtoD_v2\0") {
+                Ok(f) => f(dst, src, size),
+                Err(rc) => rc,
+            }
         }
     }
+
+    /// Async driver entry point, exposed for completeness.  The session layer
+    /// intentionally stages ring buffers through the synchronous copies above:
+    /// a ring slot may be recycled as soon as the response is written, so an
+    /// outstanding async DMA must not reference it.
+    #[allow(dead_code)]
+    pub fn memcpy_h2d_async(&self, dst: u64, src: &[u8], stream: u64) -> CuResult {
+        unsafe {
+            let f: Symbol<unsafe extern "C" fn(u64, *const c_void, u64, u64) -> CuResult> =
+                match self.sym(b"cuMemcpyHtoDAsync_v2\0") {
+                    Ok(f) => f,
+                    Err(rc) => return rc,
+                };
+            f(dst, src.as_ptr() as *const c_void, src.len() as u64, stream)
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn memcpy_d2h_async(&self, dst: &mut [u8], src: u64, stream: u64) -> CuResult {
+        unsafe {
+            let f: Symbol<unsafe extern "C" fn(*mut c_void, u64, u64, u64) -> CuResult> =
+                match self.sym(b"cuMemcpyDtoHAsync_v2\0") {
+                    Ok(f) => f,
+                    Err(rc) => return rc,
+                };
+            f(dst.as_mut_ptr() as *mut c_void, src, dst.len() as u64, stream)
+        }
+    }
+
+    /// `element_bits` is 8, 16 or 32; anything else is INVALID_VALUE.
+    pub fn memset(&self, dst: u64, value: u32, element_bits: u32, size: u64) -> CuResult {
+        unsafe {
+            match element_bits {
+                8 => {
+                    let f: Symbol<unsafe extern "C" fn(u64, u8, u64) -> CuResult> =
+                        match self.sym(b"cuMemsetD8_v2\0") {
+                            Ok(f) => f,
+                            Err(rc) => return rc,
+                        };
+                    f(dst, value as u8, size)
+                }
+                16 => {
+                    let f: Symbol<unsafe extern "C" fn(u64, u16, u64) -> CuResult> =
+                        match self.sym(b"cuMemsetD16_v2\0") {
+                            Ok(f) => f,
+                            Err(rc) => return rc,
+                        };
+                    f(dst, value as u16, size)
+                }
+                32 => {
+                    let f: Symbol<unsafe extern "C" fn(u64, u32, u64) -> CuResult> =
+                        match self.sym(b"cuMemsetD32_v2\0") {
+                            Ok(f) => f,
+                            Err(rc) => return rc,
+                        };
+                    f(dst, value, size)
+                }
+                _ => CUDA_ERROR_INVALID_VALUE,
+            }
+        }
+    }
+
+    // ── Kernels / modules ───────────────────────────────────────────────
 
     pub fn launch_kernel(
         &self,
         func: u64,
-        grid_x: u32, grid_y: u32, grid_z: u32,
-        block_x: u32, block_y: u32, block_z: u32,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
         shared_mem: u32,
         stream: u64,
-        params_offset: u64, params_size: u64,
-        shm_base: *mut u8, shm_size: usize,
+        kernel_params: *const *const c_void,
+        extra: *const *const c_void,
     ) -> CuResult {
-        /* Reconstruct kernelParams from serialized data in SHM.
-         * The guest writes each argument's value sequentially (sizeof(void*)
-         * each). We build an array of pointers into the SHM region, one per
-         * argument, so cuLaunchKernel gets a proper void** kernelParams. */
-        let param_ptrs: Vec<*const std::ffi::c_void>;
-        if params_size > 0 && !shm_base.is_null() {
-            if params_offset.checked_add(params_size).map_or(true, |end| end > shm_size as u64) {
-                return 1;
-            }
-            let slot = std::mem::size_of::<*const std::ffi::c_void>() as u64;
-            let n_params = (params_size / slot) as usize;
-            let mut ptrs: Vec<*const std::ffi::c_void> = Vec::with_capacity(n_params + 1);
-            unsafe {
-                let base = shm_base.offset(params_offset as isize);
-                for i in 0..n_params {
-                    ptrs.push(base.offset((i as isize) * slot as isize) as *const std::ffi::c_void);
-                }
-                ptrs.push(std::ptr::null());
-            }
-            param_ptrs = ptrs;
-        } else {
-            param_ptrs = Vec::new();
-        }
-
         unsafe {
-            let cu_launch: Symbol<
-                unsafe extern "C" fn(u64, u32, u32, u32, u32, u32, u32, u32, u64, *const *const std::ffi::c_void, *const *const std::ffi::c_void) -> CuResult
-            > = self.lib.get(b"cuLaunchKernel\0").unwrap();
-
-            let params_arg = if param_ptrs.is_empty() {
-                std::ptr::null()
-            } else {
-                param_ptrs.as_ptr()
+            let f: Symbol<
+                unsafe extern "C" fn(
+                    u64,
+                    u32,
+                    u32,
+                    u32,
+                    u32,
+                    u32,
+                    u32,
+                    u32,
+                    u64,
+                    *const *const c_void,
+                    *const *const c_void,
+                ) -> CuResult,
+            > = match self.sym(b"cuLaunchKernel\0") {
+                Ok(f) => f,
+                Err(rc) => return rc,
             };
-
-            cu_launch(func, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                      shared_mem, stream, params_arg, std::ptr::null())
+            f(
+                func,
+                grid.0,
+                grid.1,
+                grid.2,
+                block.0,
+                block.1,
+                block.2,
+                shared_mem,
+                stream,
+                kernel_params,
+                extra,
+            )
         }
     }
 
-    pub fn stream_create(&self) -> Result<u64, CuResult> {
+    pub fn module_load_data(&self, image: &[u8]) -> Result<u64, CuResult> {
         unsafe {
-            let cu_stream_create: Symbol<unsafe extern "C" fn(*mut u64, u32) -> CuResult> =
-                self.lib.get(b"cuStreamCreate\0").unwrap();
-            let mut stream: u64 = 0;
-            let result = cu_stream_create(&mut stream, 0);
-            if result == 0 { Ok(stream) } else { Err(result) }
-        }
-    }
-
-    pub fn stream_synchronize(&self, stream: u64) -> CuResult {
-        unsafe {
-            let cu_stream_sync: Symbol<unsafe extern "C" fn(u64) -> CuResult> =
-                self.lib.get(b"cuStreamSynchronize\0").unwrap();
-            cu_stream_sync(stream)
-        }
-    }
-
-    pub fn stream_destroy(&self, stream: u64) -> CuResult {
-        unsafe {
-            let cu_stream_destroy: Symbol<unsafe extern "C" fn(u64) -> CuResult> =
-                self.lib.get(b"cuStreamDestroy_v2\0").unwrap();
-            cu_stream_destroy(stream)
-        }
-    }
-
-    pub fn device_synchronize(&self) -> CuResult {
-        unsafe {
-            let cu_ctx_sync: Symbol<unsafe extern "C" fn() -> CuResult> =
-                self.lib.get(b"cuCtxSynchronize\0").unwrap();
-            cu_ctx_sync()
-        }
-    }
-
-    pub fn module_load_from_shm(&self, shm_offset: u64, image_size: u64, shm_base: *mut u8, shm_size: usize) -> Result<u64, CuResult> {
-        if shm_base.is_null() { return Err(1); }
-        if shm_offset.checked_add(image_size).map_or(true, |end| end > shm_size as u64) { return Err(1); }
-        unsafe {
-            let image_ptr = shm_base.offset(shm_offset as isize);
-            let cu_module_load: Symbol<unsafe extern "C" fn(*mut u64, *const std::ffi::c_void) -> CuResult> =
-                self.lib.get(b"cuModuleLoadData\0").unwrap();
+            let f: Symbol<unsafe extern "C" fn(*mut u64, *const c_void) -> CuResult> =
+                self.sym(b"cuModuleLoadData\0")?;
             let mut module: u64 = 0;
-            let result = cu_module_load(&mut module, image_ptr as *const std::ffi::c_void);
-            if result == 0 { Ok(module) } else { Err(result) }
+            let rc = f(&mut module, image.as_ptr() as *const c_void);
+            if rc == CUDA_SUCCESS {
+                Ok(module)
+            } else {
+                Err(rc)
+            }
         }
     }
 
     pub fn module_get_function(&self, module: u64, name: &str) -> Result<u64, CuResult> {
+        let c_name = match std::ffi::CString::new(name) {
+            Ok(n) => n,
+            Err(_) => return Err(CUDA_ERROR_INVALID_VALUE),
+        };
         unsafe {
-            let c_name = std::ffi::CString::new(name).unwrap();
-            let cu_module_get_func: Symbol<unsafe extern "C" fn(*mut u64, u64, *const i8) -> CuResult> =
-                self.lib.get(b"cuModuleGetFunction\0").unwrap();
+            let f: Symbol<unsafe extern "C" fn(*mut u64, u64, *const i8) -> CuResult> =
+                self.sym(b"cuModuleGetFunction\0")?;
             let mut func: u64 = 0;
-            let result = cu_module_get_func(&mut func, module, c_name.as_ptr());
-            if result == 0 { Ok(func) } else { Err(result) }
+            let rc = f(&mut func, module, c_name.as_ptr());
+            if rc == CUDA_SUCCESS {
+                Ok(func)
+            } else {
+                Err(rc)
+            }
         }
     }
 
     pub fn module_unload(&self, module: u64) -> CuResult {
         unsafe {
-            let cu_module_unload: Symbol<unsafe extern "C" fn(u64) -> CuResult> =
-                self.lib.get(b"cuModuleUnload\0").unwrap();
-            cu_module_unload(module)
+            match self.sym::<unsafe extern "C" fn(u64) -> CuResult>(b"cuModuleUnload\0") {
+                Ok(f) => f(module),
+                Err(rc) => rc,
+            }
         }
     }
+
+    pub fn func_get_attribute(&self, func: u64, attr: i32) -> Result<i32, CuResult> {
+        unsafe {
+            let f: Symbol<unsafe extern "C" fn(*mut i32, i32, u64) -> CuResult> =
+                self.sym(b"cuFuncGetAttribute\0")?;
+            let mut value: i32 = 0;
+            let rc = f(&mut value, attr, func);
+            if rc == CUDA_SUCCESS {
+                Ok(value)
+            } else {
+                Err(rc)
+            }
+        }
+    }
+
+    // ── Streams / sync ──────────────────────────────────────────────────
+
+    pub fn stream_create(&self, flags: u32) -> Result<u64, CuResult> {
+        unsafe {
+            let f: Symbol<unsafe extern "C" fn(*mut u64, u32) -> CuResult> =
+                self.sym(b"cuStreamCreate\0")?;
+            let mut stream: u64 = 0;
+            let rc = f(&mut stream, flags);
+            if rc == CUDA_SUCCESS {
+                Ok(stream)
+            } else {
+                Err(rc)
+            }
+        }
+    }
+
+    pub fn stream_synchronize(&self, stream: u64) -> CuResult {
+        unsafe {
+            match self.sym::<unsafe extern "C" fn(u64) -> CuResult>(b"cuStreamSynchronize\0") {
+                Ok(f) => f(stream),
+                Err(rc) => rc,
+            }
+        }
+    }
+
+    pub fn stream_destroy(&self, stream: u64) -> CuResult {
+        unsafe {
+            match self.sym::<unsafe extern "C" fn(u64) -> CuResult>(b"cuStreamDestroy_v2\0") {
+                Ok(f) => f(stream),
+                Err(rc) => rc,
+            }
+        }
+    }
+
+    pub fn device_synchronize(&self) -> CuResult {
+        unsafe {
+            match self.sym::<unsafe extern "C" fn() -> CuResult>(b"cuCtxSynchronize\0") {
+                Ok(f) => f(),
+                Err(rc) => rc,
+            }
+        }
+    }
+
+    // ── Events ──────────────────────────────────────────────────────────
+
+    pub fn event_create(&self, flags: u32) -> Result<u64, CuResult> {
+        unsafe {
+            let f: Symbol<unsafe extern "C" fn(*mut u64, u32) -> CuResult> =
+                self.sym(b"cuEventCreate\0")?;
+            let mut event: u64 = 0;
+            let rc = f(&mut event, flags);
+            if rc == CUDA_SUCCESS {
+                Ok(event)
+            } else {
+                Err(rc)
+            }
+        }
+    }
+
+    pub fn event_record(&self, event: u64, stream: u64) -> CuResult {
+        unsafe {
+            match self.sym::<unsafe extern "C" fn(u64, u64) -> CuResult>(b"cuEventRecord\0") {
+                Ok(f) => f(event, stream),
+                Err(rc) => rc,
+            }
+        }
+    }
+
+    pub fn event_synchronize(&self, event: u64) -> CuResult {
+        unsafe {
+            match self.sym::<unsafe extern "C" fn(u64) -> CuResult>(b"cuEventSynchronize\0") {
+                Ok(f) => f(event),
+                Err(rc) => rc,
+            }
+        }
+    }
+
+    pub fn event_elapsed_time(&self, start: u64, end: u64) -> Result<f32, CuResult> {
+        unsafe {
+            let f: Symbol<unsafe extern "C" fn(*mut f32, u64, u64) -> CuResult> =
+                self.sym(b"cuEventElapsedTime\0")?;
+            let mut ms: f32 = 0.0;
+            let rc = f(&mut ms, start, end);
+            if rc == CUDA_SUCCESS {
+                Ok(ms)
+            } else {
+                Err(rc)
+            }
+        }
+    }
+
+    pub fn event_destroy(&self, event: u64) -> CuResult {
+        unsafe {
+            match self.sym::<unsafe extern "C" fn(u64) -> CuResult>(b"cuEventDestroy_v2\0") {
+                Ok(f) => f(event),
+                Err(rc) => rc,
+            }
+        }
+    }
+
+    // ── Device queries ──────────────────────────────────────────────────
+
+    pub fn device_get(&self, ordinal: i32) -> Result<i32, CuResult> {
+        unsafe {
+            let f: Symbol<unsafe extern "C" fn(*mut i32, i32) -> CuResult> =
+                self.sym(b"cuDeviceGet\0")?;
+            let mut device: i32 = 0;
+            let rc = f(&mut device, ordinal);
+            if rc == CUDA_SUCCESS {
+                Ok(device)
+            } else {
+                Err(rc)
+            }
+        }
+    }
+
+    pub fn device_get_attribute(&self, attr: i32, device: i32) -> Result<i32, CuResult> {
+        unsafe {
+            let f: Symbol<unsafe extern "C" fn(*mut i32, i32, i32) -> CuResult> =
+                self.sym(b"cuDeviceGetAttribute\0")?;
+            let mut value: i32 = 0;
+            let rc = f(&mut value, attr, device);
+            if rc == CUDA_SUCCESS {
+                Ok(value)
+            } else {
+                Err(rc)
+            }
+        }
+    }
+
+    pub fn device_get_name(&self, device: i32) -> Result<String, CuResult> {
+        let mut buf = [0i8; 256];
+        unsafe {
+            let f: Symbol<unsafe extern "C" fn(*mut i8, i32, i32) -> CuResult> =
+                self.sym(b"cuDeviceGetName\0")?;
+            let rc = f(buf.as_mut_ptr(), buf.len() as i32, device);
+            if rc != CUDA_SUCCESS {
+                return Err(rc);
+            }
+        }
+        let bytes: Vec<u8> = buf
+            .iter()
+            .take_while(|c| **c != 0)
+            .map(|c| *c as u8)
+            .collect();
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    pub fn device_total_mem(&self, device: i32) -> Result<u64, CuResult> {
+        unsafe {
+            let f: Symbol<unsafe extern "C" fn(*mut usize, i32) -> CuResult> =
+                match self.sym(b"cuDeviceTotalMem_v2\0") {
+                    Ok(f) => f,
+                    Err(_) => match self.sym(b"cuDeviceTotalMem\0") {
+                        Ok(f) => f,
+                        Err(rc) => return Err(rc),
+                    },
+                };
+            let mut total: usize = 0;
+            let rc = f(&mut total, device);
+            if rc == CUDA_SUCCESS {
+                Ok(total as u64)
+            } else {
+                Err(rc)
+            }
+        }
+    }
+
+    pub fn ctx_get_device(&self) -> Result<i32, CuResult> {
+        unsafe {
+            let f: Symbol<unsafe extern "C" fn(*mut i32) -> CuResult> =
+                self.sym(b"cuCtxGetDevice\0")?;
+            let mut device: i32 = 0;
+            let rc = f(&mut device);
+            if rc == CUDA_SUCCESS {
+                Ok(device)
+            } else {
+                Err(rc)
+            }
+        }
+    }
+
+    // ── Contexts ────────────────────────────────────────────────────────
+
     pub fn ctx_create(&self, flags: u32, device: i32) -> Result<u64, CuResult> {
         unsafe {
-            let cu_ctx_create: Symbol<unsafe extern "C" fn(*mut u64, u32, i32) -> CuResult> =
-                self.lib.get(b"cuCtxCreate_v2\0").unwrap();
+            let f: Symbol<unsafe extern "C" fn(*mut u64, u32, i32) -> CuResult> =
+                self.sym(b"cuCtxCreate_v2\0")?;
             let mut ctx: u64 = 0;
-            let result = cu_ctx_create(&mut ctx, flags, device);
-            if result == 0 { Ok(ctx) } else { Err(result) }
+            let rc = f(&mut ctx, flags, device);
+            if rc == CUDA_SUCCESS {
+                Ok(ctx)
+            } else {
+                Err(rc)
+            }
+        }
+    }
+
+    /// `cuCtxCreate_v3` with a single SM-count execution-affinity parameter.
+    pub fn ctx_create_v3(&self, flags: u32, device: i32, sm_count: u32) -> Result<u64, CuResult> {
+        let param = CuExecAffinityParam {
+            affinity_type: CU_EXEC_AFFINITY_TYPE_SM_COUNT,
+            sm_count,
+        };
+        unsafe {
+            let f: Symbol<
+                unsafe extern "C" fn(*mut u64, *const CuExecAffinityParam, i32, u32, i32) -> CuResult,
+            > = self.sym(b"cuCtxCreate_v3\0")?;
+            let mut ctx: u64 = 0;
+            let rc = f(&mut ctx, &param, 1, flags, device);
+            if rc == CUDA_SUCCESS {
+                Ok(ctx)
+            } else {
+                Err(rc)
+            }
         }
     }
 
     pub fn ctx_set_current(&self, ctx: u64) -> CuResult {
         unsafe {
-            let cu_ctx_set: Symbol<unsafe extern "C" fn(u64) -> CuResult> =
-                self.lib.get(b"cuCtxSetCurrent_v2\0").unwrap();
-            cu_ctx_set(ctx)
-        }
-    }
-
-    pub fn ctx_get_current(&self) -> u64 {
-        unsafe {
-            let cu_ctx_get: Symbol<unsafe extern "C" fn(*mut u64) -> CuResult> =
-                self.lib.get(b"cuCtxGetCurrent_v2\0").unwrap();
-            let mut ctx: u64 = 0;
-            cu_ctx_get(&mut ctx);
-            ctx
+            match self.sym::<unsafe extern "C" fn(u64) -> CuResult>(b"cuCtxSetCurrent\0") {
+                Ok(f) => f(ctx),
+                Err(rc) => rc,
+            }
         }
     }
 
     pub fn ctx_destroy(&self, ctx: u64) -> CuResult {
         unsafe {
-            let cu_ctx_destroy: Symbol<unsafe extern "C" fn(u64) -> CuResult> =
-                self.lib.get(b"cuCtxDestroy_v2\0").unwrap();
-            cu_ctx_destroy(ctx)
+            match self.sym::<unsafe extern "C" fn(u64) -> CuResult>(b"cuCtxDestroy_v2\0") {
+                Ok(f) => f(ctx),
+                Err(rc) => rc,
+            }
+        }
+    }
+
+    // ── Primary context ─────────────────────────────────────────────────
+
+    pub fn primary_ctx_retain(&self, device: i32) -> Result<u64, CuResult> {
+        unsafe {
+            let f: Symbol<unsafe extern "C" fn(*mut u64, i32) -> CuResult> =
+                self.sym(b"cuDevicePrimaryCtxRetain\0")?;
+            let mut ctx: u64 = 0;
+            let rc = f(&mut ctx, device);
+            if rc == CUDA_SUCCESS {
+                Ok(ctx)
+            } else {
+                Err(rc)
+            }
+        }
+    }
+
+    pub fn primary_ctx_release(&self, device: i32) -> CuResult {
+        unsafe {
+            let f: Symbol<unsafe extern "C" fn(i32) -> CuResult> = match self
+                .sym(b"cuDevicePrimaryCtxRelease_v2\0")
+            {
+                Ok(f) => f,
+                Err(_) => match self.sym(b"cuDevicePrimaryCtxRelease\0") {
+                    Ok(f) => f,
+                    Err(rc) => return rc,
+                },
+            };
+            f(device)
         }
     }
 }

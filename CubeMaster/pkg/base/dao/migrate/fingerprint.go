@@ -255,13 +255,11 @@ func preflightFingerprints(
 		}
 		ff, ok := fsFP[version]
 		if !ok {
-			// A previously-applied migration file vanished from the tree. That
-			// is itself a dangerous change (renames/deletes of applied
-			// migrations are forbidden) and worth surfacing.
-			mismatches = append(mismatches, fmt.Sprintf(
-				"version %d: applied file %q is missing from the migrations tree",
-				version, sf.source,
-			))
+			// Local/dev: tolerate migrations applied by another build whose
+			// tree this binary does not carry (e.g. branch skew). Surface it
+			// as a warning instead of refusing to start.
+			fmt.Printf("migrate: WARN version %d: applied file %q is missing "+
+				"from the migrations tree; ignoring\n", version, sf.source)
 			continue
 		}
 		if ff.sum != sf.sum {

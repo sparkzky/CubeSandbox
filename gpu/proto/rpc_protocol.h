@@ -28,16 +28,72 @@ extern "C" {
 /* ─── Protocol constants ────────────────────────────────────────── */
 
 #define CUBE_GPU_RPC_MAGIC      0x43554441u  /* "CUDA" in ASCII */
-#define CUBE_GPU_RPC_VERSION    1
+#define CUBE_GPU_RPC_VERSION    2
 
 /* Default vsock port for cube-gpu-daemon */
 #define CUBE_GPU_VSOCK_PORT     0x5055u      /* "PU" = 0x5055 */
 
-/* Default IVSHMEM ring buffer sizes */
-#define CUBE_GPU_SHM_RING_SIZE  (64 * 1024 * 1024)  /* 64 MiB per direction */
+/* ─── Shared-memory (IVSHMEM) layout v2 ───────────────────────────
+ *
+ * Both the guest library and the host daemon mmap the SAME backing file
+ * (created by the shim as /var/run/cube-gpu/shm/sandbox-{id}.shm).
+ *
+ *   [0, GLOBAL_SIZE)                    cube_gpu_shm_global_t
+ *   [g2h_offset, g2h_offset + ring_hdr) G2H ring header
+ *   [g2h_offset + ring_hdr, ...)        G2H ring data  (ring_size bytes)
+ *   [h2g_offset, ...)                   H2G ring header + data
+ *
+ * ring capacity = (total_size - 2*GLOBAL_SIZE - 2*RING_HEADER_SIZE) / 2
+ *   (integer division; offsets need no alignment)
+ *   g2h_offset = 4096
+ *   h2g_offset = 4096 + 128 + ring_capacity
+ *   end        = h2g_offset + 128 + ring_capacity  (<= total_size)
+ *
+ * The host daemon is the ONLY initializer of the layout fields; the shim
+ * only writes magic/version/flags/token/total_size, and the guest attaches
+ * using the offsets returned in cube_gpu_session_init_resp (it never
+ * recomputes or resets cursors).
+ */
+#define CUBE_GPU_SHM_GLOBAL_SIZE      4096u
+#define CUBE_GPU_SHM_RING_HEADER_SIZE 128u
+#define CUBE_GPU_SHM_MAGIC            0x4355424547505531ull  /* "CUBEGPU1" */
+#define CUBE_GPU_SHM_VERSION          1u
+#define CUBE_GPU_SHM_RING_MAGIC       0x52494E47u          /* "RING" */
+#define CUBE_GPU_SHM_TOKEN_LEN        32u
 
 /* Threshold: payloads larger than this go through IVSHMEM, not inline */
 #define CUBE_GPU_SHM_THRESHOLD  (4 * 1024)          /* 4 KiB */
+
+/* Default per-direction ring size used when the file size is not known. */
+#define CUBE_GPU_SHM_RING_SIZE  (64 * 1024 * 1024)  /* 64 MiB per direction */
+
+typedef struct __attribute__((__packed__)) cube_gpu_shm_global {
+    uint64_t magic;                      /* CUBE_GPU_SHM_MAGIC */
+    uint32_t version;                    /* CUBE_GPU_SHM_VERSION */
+    uint32_t flags;
+    uint8_t  token[CUBE_GPU_SHM_TOKEN_LEN]; /* per-sandbox secret from shim */
+    uint64_t total_size;                 /* mapping size */
+    uint64_t ring_size;                  /* data capacity per direction */
+    uint64_t g2h_offset;                 /* ring header offset */
+    uint64_t h2g_offset;                 /* ring header offset */
+    uint64_t session_id;                 /* owning session (diagnostics) */
+    uint8_t  reserved[40];
+} cube_gpu_shm_global_t;
+
+/* Ring header, shared by guest and host. Both cursors are monotonic. */
+typedef struct __attribute__((__packed__)) cube_gpu_shm_ring_header {
+    uint64_t write_pos;
+    uint64_t read_pos;
+    uint64_t capacity;      /* data bytes available in the ring */
+    uint32_t magic;         /* CUBE_GPU_SHM_RING_MAGIC */
+    uint32_t flags;
+    uint32_t epoch;
+    uint32_t reserved[9];
+} cube_gpu_shm_ring_header_t;
+
+/* Session init flags */
+#define CUBE_GPU_SESSION_FLAG_NONE   0x0u
+#define CUBE_GPU_SESSION_FLAG_TOKEN  0x1u  /* shm_token is meaningful */
 
 /* ─── Flags ─────────────────────────────────────────────────────── */
 
@@ -59,6 +115,10 @@ typedef enum __attribute__((__packed__)) cube_gpu_api_id {
     CUBE_GPU_API_FREE             = 11,
     CUBE_GPU_API_MEMCPY           = 12,
     CUBE_GPU_API_MEMCPY_ASYNC     = 13,
+    CUBE_GPU_API_MEMSET           = 14,
+    CUBE_GPU_API_MEMSET_ASYNC     = 15,
+    CUBE_GPU_API_MALLOC_ASYNC     = 16,
+    CUBE_GPU_API_FREE_ASYNC       = 17,
 
     /* Kernel execution (P0) */
     CUBE_GPU_API_MODULE_LOAD      = 20,
@@ -72,18 +132,37 @@ typedef enum __attribute__((__packed__)) cube_gpu_api_id {
     CUBE_GPU_API_STREAM_SYNC      = 32,
     CUBE_GPU_API_DEVICE_SYNC      = 33,
 
+    /* Event management (P1) */
+    CUBE_GPU_API_EVENT_CREATE     = 34,
+    CUBE_GPU_API_EVENT_RECORD     = 35,
+    CUBE_GPU_API_EVENT_SYNC       = 36,
+    CUBE_GPU_API_EVENT_ELAPSED    = 37,
+    CUBE_GPU_API_EVENT_DESTROY    = 38,
+
     /* Query / properties (P1) */
     CUBE_GPU_API_GET_DEV_PROP     = 40,
     CUBE_GPU_API_MEM_GET_INFO     = 41,
     CUBE_GPU_API_GET_DEVICE       = 42,
     CUBE_GPU_API_SET_DEVICE       = 43,
     CUBE_GPU_API_DEVICE_COUNT     = 44,
+    CUBE_GPU_API_GET_DEVICE_NAME  = 45,
+    CUBE_GPU_API_DEVICE_TOTAL_MEM = 46,
+    CUBE_GPU_API_FUNC_GET_ATTR    = 47,
+    CUBE_GPU_API_CTX_GET_DEVICE   = 48,
+    CUBE_GPU_API_GET_LAST_ERROR   = 49,
 
     /* Context management (internal) */
     CUBE_GPU_API_CTX_CREATE       = 50,
     CUBE_GPU_API_CTX_DESTROY      = 51,
     CUBE_GPU_API_CTX_SET_CURRENT  = 52,
     CUBE_GPU_API_CTX_GET_CURRENT  = 53,
+    CUBE_GPU_API_PRIMARY_CTX_RETAIN  = 54,
+    CUBE_GPU_API_PRIMARY_CTX_RELEASE = 55,
+
+    /* CUDA IPC — rejected locally in the guest; reserved for diagnostics */
+    CUBE_GPU_API_IPC_GET_HANDLE   = 60,
+    CUBE_GPU_API_IPC_OPEN_HANDLE  = 61,
+    CUBE_GPU_API_IPC_CLOSE_HANDLE = 62,
 } cube_gpu_api_id_t;
 
 /* ─── Wire format: fixed header (32 bytes) ──────────────────────── */
@@ -124,14 +203,23 @@ typedef enum __attribute__((__packed__)) cube_gpu_memcpy_kind {
 
 typedef struct __attribute__((__packed__)) cube_gpu_session_init_req {
     uint64_t memory_quota;    /* Requested GPU memory quota in bytes */
-    uint64_t sandbox_id;      /* Sandbox identifier */
+    uint64_t sandbox_id;      /* Sandbox identifier (shim-provided) */
+    uint64_t sm_percent;      /* Requested SM quota percent (0 = unlimited) */
+    uint32_t shm_size_mb;     /* Size of the IVSHMEM file the guest mapped */
+    uint32_t flags;           /* CUBE_GPU_SESSION_FLAG_* */
+    uint8_t  shm_token[CUBE_GPU_SHM_TOKEN_LEN]; /* Must match the backing file */
 } cube_gpu_session_init_req_t;
 
 typedef struct __attribute__((__packed__)) cube_gpu_session_init_resp {
     uint32_t status;          /* CUresult */
+    uint32_t device_count;    /* Visible device count */
     uint64_t session_handle;  /* Server-assigned session handle */
-    uint64_t shm_offset;      /* Offset of this session's SHM region */
-    uint64_t shm_size;        /* Size of this session's SHM region */
+    uint64_t shm_total_size;  /* Attached IVSHMEM mapping size */
+    uint64_t ring_size;       /* Data capacity per direction */
+    uint64_t g2h_offset;      /* G2H ring header offset within the mapping */
+    uint64_t h2g_offset;      /* H2G ring header offset within the mapping */
+    uint32_t max_payload;     /* Max inline vsock payload accepted */
+    uint32_t reserved;
 } cube_gpu_session_init_resp_t;
 
 /* ── cudaMalloc ────────── */
@@ -210,7 +298,11 @@ typedef struct __attribute__((__packed__)) cube_gpu_module_get_func_req {
 
 typedef struct __attribute__((__packed__)) cube_gpu_module_get_func_resp {
     uint32_t status;
+    uint32_t nparams;         /* Kernel parameter count (0 if unknown) */
+    uint32_t has_meta;        /* 1 when param_sizes[] is valid */
+    uint32_t reserved;
     uint64_t func_handle;     /* Virtual function handle */
+    uint16_t param_sizes[32]; /* Byte size of each parameter (has_meta=1) */
 } cube_gpu_module_get_func_resp_t;
 
 /* ── cuLaunchKernel ────── */
@@ -294,6 +386,161 @@ typedef struct __attribute__((__packed__)) cube_gpu_mem_get_info_resp {
     uint64_t free_memory;     /* Remaining quota */
     uint64_t total_memory;    /* Total quota */
 } cube_gpu_mem_get_info_resp_t;
+
+/* ── cuMemsetD8 / D32 (sync; stream executed synchronously on host) ── */
+
+typedef struct __attribute__((__packed__)) cube_gpu_memset_req {
+    uint64_t dst;             /* Device vptr */
+    uint64_t size;            /* Bytes to fill */
+    uint32_t value;           /* Fill value (CUDA replicates per element) */
+    uint32_t element_bits;    /* 8, 16, or 32 */
+    uint64_t stream_vptr;     /* Virtual stream handle (0 = default) */
+} cube_gpu_memset_req_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_memset_resp {
+    uint32_t status;
+} cube_gpu_memset_resp_t;
+
+/* ── cuMemAllocAsync / cuMemFreeAsync (default pool only) ── */
+
+typedef struct __attribute__((__packed__)) cube_gpu_malloc_async_req {
+    uint64_t size;
+    uint64_t stream_vptr;
+} cube_gpu_malloc_async_req_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_malloc_async_resp {
+    uint32_t status;
+    uint64_t vptr;            /* Virtual device pointer (guest-assigned) */
+} cube_gpu_malloc_async_resp_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_free_async_req {
+    uint64_t vptr;
+    uint64_t stream_vptr;
+} cube_gpu_free_async_req_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_free_async_resp {
+    uint32_t status;
+} cube_gpu_free_async_resp_t;
+
+/* ── Events ────────────── */
+
+typedef struct __attribute__((__packed__)) cube_gpu_event_create_req {
+    uint32_t flags;
+} cube_gpu_event_create_req_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_event_create_resp {
+    uint32_t status;
+    uint64_t event_vptr;
+} cube_gpu_event_create_resp_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_event_record_req {
+    uint64_t event_vptr;
+    uint64_t stream_vptr;
+} cube_gpu_event_record_req_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_event_record_resp {
+    uint32_t status;
+} cube_gpu_event_record_resp_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_event_sync_req {
+    uint64_t event_vptr;
+} cube_gpu_event_sync_req_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_event_sync_resp {
+    uint32_t status;
+} cube_gpu_event_sync_resp_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_event_elapsed_req {
+    uint64_t start_vptr;
+    uint64_t end_vptr;
+} cube_gpu_event_elapsed_req_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_event_elapsed_resp {
+    uint32_t status;
+    float    milliseconds;
+} cube_gpu_event_elapsed_resp_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_event_destroy_req {
+    uint64_t event_vptr;
+} cube_gpu_event_destroy_req_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_event_destroy_resp {
+    uint32_t status;
+} cube_gpu_event_destroy_resp_t;
+
+/* ── Device / function queries ─────────────────────────── */
+
+typedef struct __attribute__((__packed__)) cube_gpu_get_dev_prop_req {
+    int32_t  device;
+    int32_t  attribute;       /* CUdevice_attribute */
+} cube_gpu_get_dev_prop_req_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_get_dev_prop_resp {
+    uint32_t status;
+    int32_t  value;
+} cube_gpu_get_dev_prop_resp_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_get_device_req {
+    int32_t ordinal;
+} cube_gpu_get_device_req_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_get_device_resp {
+    uint32_t status;
+    int32_t  device;
+} cube_gpu_get_device_resp_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_set_device_req {
+    int32_t device;
+} cube_gpu_set_device_req_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_set_device_resp {
+    uint32_t status;
+} cube_gpu_set_device_resp_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_device_count_resp {
+    uint32_t status;
+    int32_t  count;
+} cube_gpu_device_count_resp_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_device_name_resp {
+    uint32_t status;
+    char     name[256];
+} cube_gpu_device_name_resp_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_device_total_mem_resp {
+    uint32_t status;
+    uint64_t total_memory;    /* Quota-adjusted view */
+} cube_gpu_device_total_mem_resp_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_func_get_attr_req {
+    uint64_t func_vptr;
+    int32_t  attribute;       /* CUfunction_attribute */
+} cube_gpu_func_get_attr_req_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_func_get_attr_resp {
+    uint32_t status;
+    int32_t  value;
+} cube_gpu_func_get_attr_resp_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_ctx_get_device_resp {
+    uint32_t status;
+    int32_t  device;
+} cube_gpu_ctx_get_device_resp_t;
+
+/* ── Primary context (cudart compatibility) ────────────── */
+
+typedef struct __attribute__((__packed__)) cube_gpu_primary_ctx_req {
+    int32_t device;
+} cube_gpu_primary_ctx_req_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_primary_ctx_retain_resp {
+    uint32_t status;
+    uint64_t ctx_handle;
+} cube_gpu_primary_ctx_retain_resp_t;
+
+typedef struct __attribute__((__packed__)) cube_gpu_primary_ctx_release_resp {
+    uint32_t status;
+} cube_gpu_primary_ctx_release_resp_t;
 
 /* ── Context management ── */
 

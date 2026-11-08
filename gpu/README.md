@@ -1,90 +1,214 @@
-# CubeSandbox GPU Sharing
+# CubeSandbox GPU Sharing (Backend B)
 
-API-level CUDA remoting for **single-machine** CubeSandbox: CUDA calls inside a
-sandbox MicroVM are intercepted via `LD_PRELOAD` and forwarded over vsock to a
-host daemon that executes them on the **local** GPU (`VMADDR_CID_HOST`). Large
-transfers go through IVSHMEM shared memory. Design details: `docs/architecture/gpu-sharing.md`.
+API-level CUDA remoting for CubeSandbox: CUDA Driver API calls inside a
+sandbox MicroVM are intercepted by `LD_PRELOAD` (`libcube-gpu.so`) and
+forwarded over vsock to a host daemon (`cube-gpu-daemon`) that executes them
+on the local GPU. Bulk data (tensors, cubins, kernel parameter buffers) uses a
+128 MiB IVSHMEM file that **both sides mmap**, with one SPSC ring per
+direction. Design rationale and the roadmap: [`DESIGN_v2.md`](DESIGN_v2.md).
+
+This is the **software-sharing backend** ("backend B"). It provides quotas and
+misuse containment, not hardware isolation; prefer MIG or VFIO passthrough for
+untrusted multi-tenant use (see *Security model*).
 
 ## Layout
 
 | Path | Role |
 |---|---|
-| `proto/rpc_protocol.h` | Shared C protocol header (structs, API IDs, flags) |
-| `proto/rpc_protocol.rs.inc` | Rust protocol header, `include!`-ed by `vsock_listener.rs` |
-| `guest/src/` | `libcube-gpu.so` — guest-side interception library |
-| `host/` | `cube-gpu-daemon` — host-side Rust daemon |
+| `proto/rpc_protocol.h` | Shared C protocol (v2): RPC header, SHM layout, API IDs, structs |
+| `proto/rpc_protocol.rs.inc` | Rust mirror of the same constants/structs |
+| `guest/src/` | `libcube-gpu.so` — guest interception library |
+| `host/src/` | `cube-gpu-daemon` (Rust) + `cubin_params.rs` kernel-parameter metadata parser |
+| `host/tests/fixtures/` | cubin/fatbin/PTX fixtures for the metadata parser |
+| `tests/` | CUDA E2E fixtures and programs (kernel.cu/cubin/ptx, e2e_main, e2e_link, probe) |
+| `scripts/` | `e2e-test.sh`, `e2e-multi-session.sh`, `start-mps.sh`, `install-daemon.sh` |
+| `systemd/` | `cube-gpu-daemon.service` |
 
 ## Build
 
-### Guest library
-
 ```sh
-cd gpu/guest/src
-make            # -> libcube-gpu.so  (pulls rpc_protocol.h via -I../../proto)
+make -C gpu/guest/src                 # -> libcube-gpu.so
+cd gpu/host && cargo build --release  # -> target/release/cube-gpu-daemon
+make -C gpu/tests kernels programs    # E2E fixtures/binaries (needs nvcc)
 ```
 
-Requires `gcc` + glibc headers. Install the `.so` into the guest image at
-`/usr/lib/cube-gpu/libcube-gpu.so` — that path is what the shim injects as
-`LD_PRELOAD` (see `CubeShim/shim/src/sandbox/gpu.rs`).
+Install the guest library at `/usr/lib/cube-gpu/libcube-gpu.so` (the path the
+shim injects as `LD_PRELOAD`).
 
-### Host daemon
+## Runtime model
 
-```sh
-cd gpu/host
-cargo build --release
+1. The shim creates `/var/run/cube-gpu/shm/sandbox-{id}.shm` (128 MiB), writes a
+   global header with a per-sandbox random token, and injects the token plus
+   `CUBE_GPU_*` env vars into the sandbox.
+2. VMM exposes the file to the guest as an IVSHMEM device; the guest library
+   maps it (usually at `/dev/shm/cube-gpu-shm`) and opens a vsock session.
+3. The daemon mmaps the same file, validates the token, and serves the session
+   against a per-sandbox `CUcontext` (plus an MPS domain when MPS is enabled).
+
+### SHM layout (v2)
+
+```
+[0,4096)                 global header (magic/version/token/total/ring/offsets)
+[4096, 4096+128)         G2H ring header
+[4224, ...)              G2H data  (capacity bytes)
+[h2g_offset, +128)       H2G ring header
+[...)                    H2G data  (capacity bytes)
+capacity = (total - 2*4096 - 2*128) / 2
 ```
 
-This is a **standalone crate** (the repo has no root workspace), so build it on
-its own. Linux only — see *Known limitations*.
+The daemon is the only writer of the layout fields (the shim writes
+magic/version/token/total only). The guest attaches read-only w.r.t. the global
+header; only ring cursors move. Ring cursors are monotonic and persist across
+sessions in the file, so long-running hosts exercise wrap-around naturally.
 
-## Runtime prerequisites (cannot be satisfied by code)
+### Guest environment
 
-These must be provisioned on the GPU machine before the daemon can serve:
+| Var | Meaning |
+|---|---|
+| `LD_PRELOAD` | `/usr/lib/cube-gpu/libcube-gpu.so` |
+| `CUBE_GPU_SANDBOX_ID` | Sandbox id (selects the SHM file) |
+| `CUBE_GPU_MEMORY_QUOTA` | GPU memory quota in bytes (authoritative in daemon) |
+| `CUBE_GPU_VSOCK_PORT` | Daemon port (default `0x5055`) |
+| `CUBE_GPU_SHM_PATH` | Guest mapping of the IVSHMEM file |
+| `CUBE_GPU_SHM_TOKEN` | 64-hex-char token written by the shim |
+| `CUBE_GPU_SM_PERCENT` | Optional SM quota percentage |
+| `CUBE_GPU_VSOCK_CID` | Optional override (default 2); use `1` for host-loopback tests |
 
-- **NVIDIA driver + `libcuda.so.1`** — loaded at runtime via `libloading`; if
-  missing the daemon exits with code 1 (`gpu/host/src/main.rs`).
-- **Root** — required to bind the vsock listener and mmap IVSHMEM backing files.
-- **MPS (Multi-Process Service)** — consumer GPUs lack MIG, so MPS is used for
-  concurrent multi-tenant kernel execution. Start `nvidia-cuda-mps-control`.
-- **IVSHMEM backing dir** — default `/var/run/cube-gpu/shm`, writable by the
-  daemon. One `.shm` file per sandbox, created/removed with the session.
-
-### Daemon environment variables
+### Daemon environment
 
 | Var | Default | Note |
 |---|---|---|
-| `CUBE_GPU_VSOCK_PORT` | `0x5055` | vsock port to listen on |
-| `CUBE_GPU_SHM_DIR` | `/var/run/cube-gpu/shm` | IVSHMEM backing-file directory |
+| `CUBE_GPU_VSOCK_PORT` | `0x5055` (decimal 20565) | Listen port |
+| `CUBE_GPU_SHM_DIR` | `/var/run/cube-gpu/shm` | Backing-file directory |
 
-The tracing filter is **hardcoded** to `cube_gpu_daemon=debug` in `main.rs` and
-does **not** read `RUST_LOG`. Change the source to use `EnvFilter::from_default_env()`
-if runtime log control is needed.
+Logging uses a hardcoded `cube_gpu_daemon=debug` filter in `main.rs`.
 
 ## Per-sandbox enablement
 
-Set annotation `cube.gpu` on the sandbox spec:
-
 ```json
-{"enable": true, "memory_quota_mb": 4096, "vsock_port": 0}
+{"enable": true, "memory_quota_mb": 4096, "vsock_port": 0, "sm_percent": 50}
 ```
 
-The shim then injects `LD_PRELOAD` + `CUBE_GPU_*` env vars into the container
-process and wires an IVSHMEM device into the MicroVM config
+`sm_percent` is optional; the daemon attempts `cuCtxCreate_v3` SM affinity and
+falls back to a normal context when the driver does not support it (or MPS is
+not enabled). The shim wires the IVSHMEM device and env vars
 (`CubeShim/shim/src/sandbox/{config,gpu,sb}.rs`, `container/mod.rs`).
+
+## API coverage (v2)
+
+* **Memory**: `cuMemAlloc/Free`, `cuMemAllocAsync/FreeAsync` (default pool),
+  `cuMemcpyHtoD/DtoH/DtoD`, async variants (executed synchronously on the host;
+  see limitations), `cuMemsetD8/D16/D32`.
+* **Module/kernel**: `cuModuleLoadData(_Ex)`, `cuModuleGetFunction`,
+  `cuLaunchKernel` (both `kernelParams` via cubin/fatbin/PTX metadata and
+  `extra` buffer pointers), `cuFuncGetAttribute`.
+* **Context/stream/event**: create/destroy/set/get/synchronize, primary-context
+  retain/release (cudart compatibility), stream create/destroy/sync, event
+  create/record/sync/elapsed/destroy.
+* **Queries**: device count/get/name/attribute, `cuDeviceTotalMem` and
+  `cuMemGetInfo` return the **quota view**.
+* **IPC**: `cuIpcGetMemHandle/OpenMemHandle/CloseMemHandle` always return
+  `CUDA_ERROR_NOT_SUPPORTED` — CUDA IPC is a cross-tenant leak surface and is
+  disabled by design.
+
+Unknown APIs resolve to the real driver only if it is visible; inside a
+MicroVM there is no device node, so they fail cleanly.
+
+## Testing
+
+```sh
+cd gpu/host && cargo test          # unit tests: SHM layout/token/wrap, ownership,
+                                   # quota, cubin/fatbin/PTX param metadata
+bash gpu/scripts/e2e-test.sh       # host-loopback E2E over vsock CID 1 with the
+                                   # real GPU: cubin + PTX kernels, 32-byte struct
+                                   # params, events, async alloc, quota OOM,
+                                   # direct-link interception
+bash gpu/scripts/e2e-multi-session.sh  # parallel sessions + SIGKILL reclaim
+```
+
+The E2E scripts create sparse 128 MiB files, start the daemon on a private
+port, and drive `gpu/tests/e2e_main` with `LD_PRELOAD`. `vsock_loopback` must
+be loaded (`sudo modprobe vsock_loopback`).
+
+## Security model (honest boundaries)
+
+* The MicroVM boundary is the real security boundary: the guest has no GPU
+  device node, so bypassing the hook fails instead of escaping.
+* The daemon enforces allocation ownership, quotas (including async paths),
+  context/module/stream/event ownership, and blocks CUDA IPC.
+* **Shared backend is not hardware isolation**: memory bandwidth, cache, and
+  the driver fault domain are shared; a driver-level fault can affect other
+  sessions on the same GPU. Use MIG or VFIO passthrough for untrusted tenants.
+* MPS is supported as a deployment option (`scripts/start-mps.sh`); it improves
+  concurrency but does not partition the fault domain.
+
+## Real-sandbox validation (CubeSandbox deployment, 2026-11)
+
+Backend B was validated end-to-end in **actual KVM sandboxes** on a one-click
+deployment (RTX 3060, driver 615.71):
+
+* Sandboxes were created through the E2B-compatible API with
+  `metadata={"cube.gpu": '{"enable":true,"memory_quota_mb":512}'}`.
+* Inside each sandbox, `e2e_main` ran over envd and passed **17/17** checks:
+  quota-sized `cuDeviceTotalMem`/`cuMemGetInfo`, 1 MiB H2D/D2H through the
+  IVSHMEM BAR, cubin module load, `add_one`/`mixed`/32-byte-struct kernels,
+  `cuMemsetD32`, events, and async allocation.
+* Three sandboxes ran concurrently with 512/256/256 MB quotas: each reported
+  **its own** quota view, the 256 MB sandbox hit `CUDA_ERROR_OUT_OF_MEMORY` at
+  its own limit, and killing one sandbox left the other two fully functional
+  (they re-ran the full suite after the kill).
+
+### Deployment changes that were required
+
+1. **Cubelet storage**: `cubecow` needs a reflink-capable filesystem
+   (`/data/cubelet/storage` must not be ext4). A loop-mounted XFS image with
+   `-m reflink=1` was used.
+2. **Annotation plumbing**: CubeAPI lifts `metadata["cube.gpu"]` into the
+   sandbox annotations, and CubeMaster must forward the non-`cube.master`
+   `cube.gpu` key to Cubelet (both patched in this branch).
+3. **Shim/hypervisor** (branch changes):
+   * restore path passes the per-sandbox `IvshmemConfig`;
+   * device restore tolerates devices absent from the snapshot (IVSHMEM is
+     attached after the template snapshot);
+   * the IVSHMEM BAR2 KVM memory slot follows guest BAR reprogramming, and the
+     guest library triggers `/sys/bus/pci/rescan` when the device is not yet
+     enumerated;
+   * guest library no longer needs `GLIBC_2.38` (`strtoull` redirect removed),
+     so it loads on older guest userspaces such as Debian 12.
+4. **Guest image** must contain `libcube-gpu.so`, the `libcuda.so.1` symlink,
+   and the test binaries (see `gpu/tests/`). The shim only creates sandbox
+   state; it does not install the library into the image.
+
+### Remaining integration gaps (found during validation)
+
+* **Restored containers do not inherit the shim-injected `CUBE_GPU_*`
+  environment.** Templates are memory snapshots, so the container process that
+  starts at restore time carries template-build-time env. The validation
+  supplied `CUBE_GPU_*` explicitly through envd. Production needs either
+  restore-time env injection or a zero-env bootstrap (read `session_id`,
+  `token`, and quota from the IVSHMEM global header).
+* **Guest→host vsock is a Unix-socket proxy in this VMM**:
+  `/run/vc/vm/<sandbox_id>/cube.sock_<port>`. The daemon must bind one listener
+  per sandbox there (or the shim must register the sandbox with the daemon).
+  The validation used a small bridge from that socket to the daemon's AF_VSOCK
+  listener.
+* Cleanup of resources already torn down by the client is tolerated
+  (`INVALID_HANDLE`/`INVALID_CONTEXT`), but a Cubelet quarantine hook is still
+  absent for genuine cleanup failures.
 
 ## Known limitations
 
-- **macOS cannot build the host or shim crates.** The dependency stack
-  (`kvm-ioctls`, `io-uring`, `vmm_sys_util`, `net_gen`, `qcow`, …) is Linux-only.
-  Build and test on a Linux machine with KVM.
-- **Protocol header is 40 bytes, not 32.** Early drafts of the architecture doc
-  said 32; the packed `RpcHeader` is 40 B on both sides — the doc has been
-  corrected, keep it that way if you touch `rpc_protocol.h`.
-- **Software isolation only.** MPS enables concurrent execution without hardware
-  partitioning; `memory_quota_mb` is enforced in software by the daemon. A
-  runaway kernel can still monopolize compute units.
-- **P0 API surface only.** Only the P0 APIs in `rpc_protocol.h` are dispatched by
-  the host (`session.rs`). Query/property/context APIs (P1, ids 40+) and the
-  context-management range (50+) are defined in the protocol but not handled.
-- **Host daemon process management is manual.** There is no systemd unit yet
-  (tracked as a follow-up in `docs/architecture/gpu-sharing.md`).
+* Async memory operations (`cuMemcpy*Async`, `cuMemAllocAsync`) complete
+  synchronously in the daemon because the staging ring buffer cannot outlive
+  the call. Semantics are stronger than required, at a latency cost.
+* `cuGetLastError` always reports success; per-call errors are returned
+  directly.
+* No Cubelet resource state machine or GPU-aware scheduling yet (`cube.gpu`
+  annotation is forwarded, but inventory/placement is not implemented).
+* No per-session daemon process isolation; all sessions share one daemon
+  process and one MPS server (fault domain = GPU).
+* Kernels whose module image has no discoverable parameter metadata (e.g.
+  hand-written PTX without `.param`, stripped binaries) reject
+  `kernelParams` launches with `CUDA_ERROR_NOT_SUPPORTED`; the `extra`
+  buffer path and cubin/fatbin/PTX metadata cover the normal cases.
+* Host/shim crates are Linux-only.

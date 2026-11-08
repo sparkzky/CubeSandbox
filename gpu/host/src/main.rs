@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod cuda_runtime;
+mod cubin_params;
 mod session;
 mod shm_manager;
 mod vsock_listener;

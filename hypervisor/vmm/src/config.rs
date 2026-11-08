@@ -2114,6 +2114,7 @@ pub struct RestoreConfig {
     pub fs: Option<Vec<FsConfig>>,
     pub vsock: Option<VsockConfig>,
     pub pmem: Option<Vec<PmemConfig>>,
+    pub ivshmem: Option<IvshmemConfig>,
     #[serde(default)]
     pub dirty_log: bool,
     /// Optional existing memory blob path for reading memory range data from a
@@ -2165,6 +2166,7 @@ impl RestoreConfig {
             fs: None,
             vsock: None,
             pmem: None,
+            ivshmem: None,
             dirty_log,
             memory_vol_url,
         })

@@ -1,0 +1,6 @@
+# Test binaries built by make (kernel.cubin / kernel.ptx are committed).
+e2e_main
+e2e_link
+vsock_probe
+session_hold
+*.o

@@ -37,6 +37,9 @@ const (
 
 const (
 	CubeAnnotationsPrefix                   = "cube.master"
+	// AnnotationsGPU is forwarded verbatim to Cubelet/CubeShim; the shim
+	// interprets it as the per-sandbox GPU sharing request (backend B).
+	AnnotationsGPU                          = "cube.gpu"
 	CubeAnnotationsVIPs                     = "cube.master.vips"
 	CubeAnnotationsBlkQos                   = "cube.master.blk.qos"
 	CubeAnnotationsFSQos                    = "cube.master.fs.qos"

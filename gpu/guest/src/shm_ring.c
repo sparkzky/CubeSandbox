@@ -2,111 +2,165 @@
  * Copyright (c) 2024 Tencent Inc.
  * SPDX-License-Identifier: Apache-2.0
  *
- * SHM ring buffer implementation.
+ * SHM ring buffer implementation (protocol v2).
+ *
+ * Cursors are 64-bit monotonic counters; positions inside the data area are
+ * computed modulo the capacity (the capacity is NOT required to be a power
+ * of two). The guest is a single producer on G2H and a single consumer on
+ * H2G, and all ring traffic is serialized by the global RPC lock, so plain
+ * acquire/release atomics are sufficient for publishing cursors.
  */
 
 #include "shm_ring.h"
-#include <string.h>
-#include <stdatomic.h>
 
-static inline void cache_flush(volatile void *p) {
-    __asm__ __volatile__("" : : "r"(p) : "memory");
+#include <string.h>
+
+_Static_assert(sizeof(cube_gpu_shm_ring_header_t) <= CUBE_GPU_SHM_RING_HEADER_SIZE,
+               "ring header must fit in its 128-byte slot");
+_Static_assert(sizeof(cube_gpu_shm_global_t) <= CUBE_GPU_SHM_GLOBAL_SIZE,
+               "global header must fit in its 4096-byte slot");
+
+/* The header is shared with another process: always access the cursors with
+ * explicit ordering instead of relying on compiler/CPU ordering. */
+#define RING_LOAD(field) \
+    __atomic_load_n((const uint64_t *)(const void *)&(field), __ATOMIC_ACQUIRE)
+#define RING_STORE(field, value) \
+    __atomic_store_n((uint64_t *)(void *)&(field), (value), __ATOMIC_RELEASE)
+
+static uint64_t ring_used(const cube_gpu_shm_ring_t *ring, uint64_t *w_out, uint64_t *r_out) {
+    uint64_t cap = ring->data_size;
+    uint64_t w = RING_LOAD(ring->header->write_pos);
+    uint64_t r = RING_LOAD(ring->header->read_pos);
+    if (w_out) *w_out = w;
+    if (r_out) *r_out = r;
+    if (w >= r) return w - r;
+    /* Corrupt/crossing cursor; treat as full to fail safe. */
+    return cap;
 }
 
-int cube_gpu_shm_channel_init(cube_gpu_shm_channel_t *ch, void *shm_base, size_t shm_size) {
-    if (!shm_base || shm_size < CUBE_GPU_SHM_RING_HEADER_SIZE * 2 + 64) return -1;
+size_t cube_gpu_shm_ring_avail_write(const cube_gpu_shm_ring_t *ring) {
+    uint64_t cap = ring->data_size;
+    uint64_t used;
+    if (!ring->header || !ring->data || cap == 0) return 0;
+    used = ring_used(ring, NULL, NULL);
+    if (used >= cap) return 0;
+    return (size_t)(cap - used - 1);
+}
 
-    ch->base = shm_base;
-    ch->total_size = shm_size;
+size_t cube_gpu_shm_ring_avail_read(const cube_gpu_shm_ring_t *ring) {
+    uint64_t cap = ring->data_size;
+    uint64_t used;
+    if (!ring->header || !ring->data || cap == 0) return 0;
+    used = ring_used(ring, NULL, NULL);
+    if (used > cap) used = cap;
+    return (size_t)used;
+}
 
-    size_t half = shm_size / 2;
+size_t cube_gpu_shm_ring_write(cube_gpu_shm_ring_t *ring, const void *data, size_t len) {
+    uint64_t cap, w;
+    size_t off, first;
+    const uint8_t *src = (const uint8_t *)data;
 
-    uint8_t *g2h_base = (uint8_t *)shm_base;
-    uint8_t *h2g_base = (uint8_t *)shm_base + half;
+    if (!ring || !ring->header || !ring->data || !data || len == 0) return 0;
 
-    ch->g2h.header = (volatile cube_gpu_shm_ring_header_t *)g2h_base;
-    ch->g2h.data   = g2h_base + CUBE_GPU_SHM_RING_HEADER_SIZE;
-    ch->g2h.data_size = half - CUBE_GPU_SHM_RING_HEADER_SIZE;
+    cap = ring->data_size;
+    if (len > cube_gpu_shm_ring_avail_write(ring)) return 0; /* never split a message */
 
-    ch->h2g.header = (volatile cube_gpu_shm_ring_header_t *)h2g_base;
-    ch->h2g.data   = h2g_base + CUBE_GPU_SHM_RING_HEADER_SIZE;
-    ch->h2g.data_size = half - CUBE_GPU_SHM_RING_HEADER_SIZE;
+    w = RING_LOAD(ring->header->write_pos);
+    off = (size_t)(w % cap);
+    first = (size_t)(cap - off);
+    if (first > len) first = len;
 
-    cube_gpu_shm_ring_header_t init_hdr = {0};
-    init_hdr.capacity = ch->g2h.data_size;
-    memcpy((void *)ch->g2h.header, &init_hdr, sizeof(init_hdr));
+    memcpy(ring->data + off, src, first);
+    if (len > first) memcpy(ring->data, src + first, len - first);
 
-    init_hdr.capacity = ch->h2g.data_size;
-    memcpy((void *)ch->h2g.header, &init_hdr, sizeof(init_hdr));
+    RING_STORE(ring->header->write_pos, w + (uint64_t)len);
+    return len;
+}
 
+size_t cube_gpu_shm_ring_read(cube_gpu_shm_ring_t *ring, void *buf, size_t len) {
+    uint64_t cap, r;
+    size_t off, first;
+    uint8_t *dst = (uint8_t *)buf;
+
+    if (!ring || !ring->header || !ring->data || !buf || len == 0) return 0;
+
+    cap = ring->data_size;
+    if (len > cube_gpu_shm_ring_avail_read(ring)) return 0;
+
+    r = RING_LOAD(ring->header->read_pos);
+    off = (size_t)(r % cap);
+    first = (size_t)(cap - off);
+    if (first > len) first = len;
+
+    memcpy(dst, ring->data + off, first);
+    if (len > first) memcpy(dst + first, ring->data, len - first);
+
+    RING_STORE(ring->header->read_pos, r + (uint64_t)len);
+    return len;
+}
+
+static int ring_attach_one(cube_gpu_shm_ring_t *ring, uint8_t *base, size_t total,
+                           uint64_t offset, uint64_t ring_size) {
+    cube_gpu_shm_ring_header_t *hdr;
+    uint64_t w, r;
+
+    if (!ring_size || offset > (uint64_t)total) return -1;
+    if ((uint64_t)total - offset < CUBE_GPU_SHM_RING_HEADER_SIZE) return -1;
+    if ((uint64_t)total - offset - CUBE_GPU_SHM_RING_HEADER_SIZE < ring_size) return -1;
+
+    hdr = (cube_gpu_shm_ring_header_t *)(void *)(base + (size_t)offset);
+    if (hdr->magic != CUBE_GPU_SHM_RING_MAGIC) return -1;
+    if (hdr->capacity != ring_size) return -1;
+
+    w = RING_LOAD(hdr->write_pos);
+    r = RING_LOAD(hdr->read_pos);
+    if (w < r || w - r > ring_size) return -1;
+
+    ring->header = hdr;
+    ring->data = base + (size_t)offset + CUBE_GPU_SHM_RING_HEADER_SIZE;
+    ring->data_size = (size_t)ring_size;
+    return 0;
+}
+
+int cube_gpu_shm_channel_attach(cube_gpu_shm_channel_t *ch, void *base, size_t total,
+                                uint64_t g2h_off, uint64_t h2g_off, uint64_t ring_size) {
+    uint8_t *bytes = (uint8_t *)base;
+
+    if (!ch || !base || total < sizeof(cube_gpu_shm_global_t)) return -1;
+    if (g2h_off < sizeof(cube_gpu_shm_global_t)) return -1;
+    if (h2g_off < sizeof(cube_gpu_shm_global_t)) return -1;
+
+    memset(ch, 0, sizeof(*ch));
+
+    if (ring_attach_one(&ch->g2h, bytes, total, g2h_off, ring_size) < 0) return -1;
+    if (ring_attach_one(&ch->h2g, bytes, total, h2g_off, ring_size) < 0) {
+        cube_gpu_shm_channel_destroy(ch);
+        return -1;
+    }
+
+    /* The two rings must not overlap (neither with each other nor the
+     * global header, which is covered by the offset checks above). */
+    if (g2h_off <= h2g_off) {
+        if (g2h_off + CUBE_GPU_SHM_RING_HEADER_SIZE + ring_size > h2g_off) {
+            cube_gpu_shm_channel_destroy(ch);
+            return -1;
+        }
+    } else {
+        if (h2g_off + CUBE_GPU_SHM_RING_HEADER_SIZE + ring_size > g2h_off) {
+            cube_gpu_shm_channel_destroy(ch);
+            return -1;
+        }
+    }
+
+    ch->base = base;
+    ch->total_size = total;
+    ch->g2h_offset = g2h_off;
+    ch->h2g_offset = h2g_off;
     return 0;
 }
 
 void cube_gpu_shm_channel_destroy(cube_gpu_shm_channel_t *ch) {
-    ch->base = NULL;
-    ch->total_size = 0;
-}
-
-size_t cube_gpu_shm_ring_avail_write(const cube_gpu_shm_ring_t *ring) {
-    uint64_t w = atomic_load((_Atomic uint64_t *)&ring->header->write_pos);
-    uint64_t r = atomic_load((_Atomic uint64_t *)&ring->header->read_pos);
-    if (w >= r) return ring->data_size - (w - r) - 1;
-    return (r - w) - 1;
-}
-
-size_t cube_gpu_shm_ring_avail_read(const cube_gpu_shm_ring_t *ring) {
-    uint64_t w = atomic_load((_Atomic uint64_t *)&ring->header->write_pos);
-    uint64_t r = atomic_load((_Atomic uint64_t *)&ring->header->read_pos);
-    if (w >= r) return w - r;
-    return ring->data_size - (r - w);
-}
-
-size_t cube_gpu_shm_ring_write(cube_gpu_shm_ring_t *ring, const void *data, size_t len) {
-    if (!data || len == 0) return 0;
-    size_t avail = cube_gpu_shm_ring_avail_write(ring);
-    if (avail == 0) return 0;
-    size_t to_write = len < avail ? len : avail;
-
-    uint64_t w = atomic_load((_Atomic uint64_t *)&ring->header->write_pos);
-    uint64_t mask = ring->data_size - 1;
-
-    size_t first_chunk = ring->data_size - (w % ring->data_size);
-    if (first_chunk > to_write) first_chunk = to_write;
-
-    memcpy(ring->data + (w % ring->data_size), data, first_chunk);
-    if (to_write > first_chunk) {
-        memcpy(ring->data, (const uint8_t *)data + first_chunk, to_write - first_chunk);
-    }
-
-    atomic_store((_Atomic uint64_t *)&ring->header->write_pos, w + to_write);
-    cache_flush(&ring->header->write_pos);
-    return to_write;
-}
-
-size_t cube_gpu_shm_ring_read(cube_gpu_shm_ring_t *ring, void *buf, size_t len) {
-    if (!buf || len == 0) return 0;
-    size_t avail = cube_gpu_shm_ring_avail_read(ring);
-    if (avail == 0) return 0;
-    size_t to_read = len < avail ? len : avail;
-
-    uint64_t r = atomic_load((_Atomic uint64_t *)&ring->header->read_pos);
-
-    size_t first_chunk = ring->data_size - (r % ring->data_size);
-    if (first_chunk > to_read) first_chunk = to_read;
-
-    memcpy(buf, ring->data + (r % ring->data_size), first_chunk);
-    if (to_read > first_chunk) {
-        memcpy((uint8_t *)buf + first_chunk, ring->data, to_read - first_chunk);
-    }
-
-    atomic_store((_Atomic uint64_t *)&ring->header->read_pos, r + to_read);
-    cache_flush(&ring->header->read_pos);
-    return to_read;
-}
-
-void cube_gpu_shm_ring_reset(cube_gpu_shm_ring_t *ring) {
-    atomic_store((_Atomic uint64_t *)&ring->header->write_pos, 0);
-    atomic_store((_Atomic uint64_t *)&ring->header->read_pos, 0);
-    cache_flush(&ring->header->write_pos);
-    cache_flush(&ring->header->read_pos);
+    if (!ch) return;
+    memset(ch, 0, sizeof(*ch));
 }

@@ -1,0 +1,33 @@
+[Unit]
+Description=CubeSandbox GPU sharing daemon (CUDA API remoting over vsock)
+Documentation=https://github.com/Tencent/CubeSandbox/blob/main/gpu/README.md
+# The daemon only needs the host network stack; it binds a vsock port, not TCP.
+After=network.target
+# MPS variant: when the daemon relies on a single host MPS server, start it
+# before the daemon (install this unit after gpu/scripts/start-mps.sh has been
+# validated on the node, or wire it up with a companion unit):
+#   After=nvidia-cuda-mps.service
+#   Wants=nvidia-cuda-mps.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cube-gpu-daemon
+# Backing files are created by the shim under this directory; the daemon is
+# the only process that maps them. Keep this in sync with
+# GpuIntegration::ivshmem_backing_file_path in the shim.
+Environment=CUBE_GPU_SHM_DIR=/var/run/cube-gpu/shm
+# 0x5055 == 20565; written in decimal so systemd passes it through verbatim
+# (the daemon parses it with str::parse::<u32>()).
+Environment=CUBE_GPU_VSOCK_PORT=20565
+Restart=always
+RestartSec=2
+# CUDA driver allocations must stay resident; the default 64 KiB memlock limit
+# makes cuMemAlloc fail with CUDA_ERROR_OUT_OF_MEMORY.
+LimitMEMLOCK=infinity
+# The daemon mmaps only its own backing files and binds a vsock port; no
+# additional capabilities are required beyond running as root.
+# ProtectSystem/PrivateTmp are intentionally left off: the backing files live
+# under /var/run and must be visible to the shim and the VMM.
+
+[Install]
+WantedBy=multi-user.target

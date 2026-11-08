@@ -79,6 +79,7 @@ impl From<RollbackRestoreConfig> for RestoreConfig {
             fs: r.fs,
             vsock: r.vsock,
             pmem: r.pmem,
+            ivshmem: None,
             prefault: r.prefault,
             dirty_log: r.dirty_log,
             memory_vol_url: r.memory_vol_url,
