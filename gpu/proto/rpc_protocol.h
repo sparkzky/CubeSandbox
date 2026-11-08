@@ -77,7 +77,8 @@ typedef struct __attribute__((__packed__)) cube_gpu_shm_global {
     uint64_t g2h_offset;                 /* ring header offset */
     uint64_t h2g_offset;                 /* ring header offset */
     uint64_t session_id;                 /* owning session (diagnostics) */
-    uint8_t  reserved[40];
+    uint64_t memory_quota;               /* per-sandbox GPU memory quota */
+    uint8_t  reserved[32];
 } cube_gpu_shm_global_t;
 
 /* Ring header, shared by guest and host. Both cursors are monotonic. */

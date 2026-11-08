@@ -2,9 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #[cfg(feature = "vsock")]
+use std::collections::HashMap;
+#[cfg(feature = "vsock")]
+use std::os::unix::fs::FileTypeExt;
+use std::path::PathBuf;
+#[cfg(feature = "vsock")]
 use std::sync::Arc;
 #[cfg(feature = "vsock")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "vsock")]
+use tokio::net::UnixListener;
 #[cfg(feature = "vsock")]
 use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 #[cfg(feature = "vsock")]
@@ -33,20 +40,24 @@ pub async fn run(
         info!("New connection from CID {}", cid);
 
         let mgr = session_mgr.clone();
+        let peer = format!("CID {}", cid);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, cid, mgr).await {
-                error!("Connection handler error for CID {}: {:?}", cid, e);
+            if let Err(e) = handle_connection(stream, peer.clone(), mgr).await {
+                error!("Connection handler error for {}: {:?}", peer, e);
             }
         });
     }
 }
 
 #[cfg(feature = "vsock")]
-async fn handle_connection(
-    mut stream: tokio_vsock::VsockStream,
-    cid: u32,
+async fn handle_connection<S>(
+    mut stream: S,
+    peer: String,
     session_mgr: Arc<SessionManager>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     let mut session_handle: Option<u64> = None;
     let mut failure: Option<Box<dyn std::error::Error + Send + Sync>> = None;
 
@@ -66,20 +77,20 @@ async fn handle_connection(
         let version = hdr.version;
         let payload_len = hdr.payload_len;
         if magic != CUBE_GPU_RPC_MAGIC {
-            warn!("Invalid magic from CID {}: 0x{:08x}", cid, magic);
+            warn!("Invalid magic from {}: 0x{:08x}", peer, magic);
             break;
         }
         if version != CUBE_GPU_RPC_VERSION {
             warn!(
-                "Unsupported protocol version {} from CID {} (expected {})",
-                version, cid, CUBE_GPU_RPC_VERSION
+                "Unsupported protocol version {} from {} (expected {})",
+                version, peer, CUBE_GPU_RPC_VERSION
             );
             break;
         }
         if payload_len as usize > MAX_PAYLOAD {
             warn!(
-                "Payload too large from CID {}: {} bytes (max {})",
-                cid, payload_len, MAX_PAYLOAD
+                "Payload too large from {}: {} bytes (max {})",
+                peer, payload_len, MAX_PAYLOAD
             );
             break;
         }
@@ -108,10 +119,106 @@ async fn handle_connection(
         session_mgr.destroy_session(h);
     }
 
-    info!("CID {} disconnected", cid);
+    info!("{} disconnected", peer);
     match failure {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+
+/// Per-sandbox virtio-vsock is proxied by the VMM to a unix socket named
+/// `<vm_dir>/<sandbox_id>/cube.sock_<guest_port>`. The daemon watches the
+/// VM directory and serves each sandbox natively (no external bridge).
+#[cfg(feature = "vsock")]
+pub async fn run_unix_watcher(
+    guest_port: u32,
+    vm_dir: String,
+    session_mgr: Arc<SessionManager>,
+) {
+    let mut listeners: HashMap<PathBuf, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(300));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        interval.tick().await;
+        let mut seen: HashMap<PathBuf, bool> = HashMap::new();
+
+        match std::fs::read_dir(&vm_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let dir = entry.path();
+                    if !dir.is_dir() {
+                        continue;
+                    }
+                    let sock_path = dir.join(format!("cube.sock_{}", guest_port));
+                    seen.insert(sock_path.clone(), true);
+                    if listeners.contains_key(&sock_path) {
+                        continue;
+                    }
+                    match std::fs::symlink_metadata(&sock_path) {
+                        Ok(meta) if meta.file_type().is_socket() => {
+                            let _ = std::fs::remove_file(&sock_path);
+                        }
+                        Ok(_) => continue,
+                        Err(_) => {}
+                    }
+                    match UnixListener::bind(&sock_path) {
+                        Ok(listener) => {
+                            info!("Listening on sandbox vsock proxy {:?}", sock_path);
+                            let mgr = session_mgr.clone();
+                            let path = sock_path.clone();
+                            let handle = tokio::spawn(async move {
+                                loop {
+                                    match listener.accept().await {
+                                        Ok((stream, _)) => {
+                                            let mgr = mgr.clone();
+                                            let peer = format!("sandbox {}", path.display());
+                                            tokio::spawn(async move {
+                                                if let Err(e) = handle_connection(
+                                                    stream,
+                                                    peer.clone(),
+                                                    mgr,
+                                                )
+                                                .await
+                                                {
+                                                    error!(
+                                                        "Connection handler error for {}: {:?}",
+                                                        peer, e
+                                                    );
+                                                }
+                                            });
+                                        }
+                                        Err(e) => {
+                                            warn!("unix accept error on {:?}: {:?}", path, e);
+                                            break;
+                                        }
+                                    }
+                                }
+                            });
+                            listeners.insert(sock_path, handle);
+                        }
+                        Err(e) => {
+                            warn!("bind {:?} failed: {:?}", sock_path, e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("cannot read vm dir {}: {:?}", vm_dir, e);
+            }
+        }
+
+        listeners.retain(|path, handle| {
+            if seen.contains_key(path) {
+                true
+            } else {
+                handle.abort();
+                let _ = std::fs::remove_file(path);
+                info!("Stopped sandbox vsock proxy {:?}", path);
+                false
+            }
+        });
     }
 }
 

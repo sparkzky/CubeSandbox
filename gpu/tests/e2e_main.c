@@ -325,17 +325,23 @@ static int run_quota_oom(void)
     size_t size;
     int count = 0;
 
-    if (g_quota == 0) {
-        fail_msg("quota-oom", "CUBE_GPU_MEMORY_QUOTA must be set");
-        goto done;
-    }
-
     res = api.cuInit(0);
     if (res != CUDA_SUCCESS) { fail_cuda("cuInit", res); goto done; }
     res = api.cuDeviceGetCount(&count);
     if (res != CUDA_SUCCESS || count < 1) { fail_cuda("cuDeviceGetCount", res); goto done; }
     res = api.cuDeviceGet(&dev, 0);
     if (res != CUDA_SUCCESS) { fail_cuda("cuDeviceGet", res); goto done; }
+    if (g_quota == 0) {
+        /* Zero-config mode: the quota comes from the shared-memory header
+         * via the daemon's quota-adjusted device view. */
+        size_t qm = 0;
+        res = api.cuDeviceTotalMem(&qm, dev);
+        if (res == CUDA_SUCCESS && qm > 0) g_quota = (uint64_t)qm;
+    }
+    if (g_quota == 0) {
+        fail_msg("quota-oom", "no GPU quota in env or device view");
+        goto done;
+    }
     res = api.cuCtxCreate(&ctx, 0, dev);
     if (res != CUDA_SUCCESS) { fail_cuda("cuCtxCreate", res); goto done; }
 

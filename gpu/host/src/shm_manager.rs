@@ -283,7 +283,8 @@ fn initialize(
         g2h_offset: g2h,
         h2g_offset: h2g,
         session_id: sandbox_id,
-        reserved: [0u8; 40],
+        memory_quota: 0,
+        reserved: [0u8; 32],
     };
     unsafe { std::ptr::write_unaligned(base as *mut ShmGlobal, global) };
     fence(Ordering::SeqCst);
@@ -594,7 +595,8 @@ mod tests {
                 g2h_offset: 0,
                 h2g_offset: 0,
                 session_id: 9,
-                reserved: [0u8; 40],
+                memory_quota: 0,
+                reserved: [0u8; 32],
             };
             unsafe { std::ptr::write_unaligned(ptr as *mut ShmGlobal, g) };
             unsafe { libc::munmap(ptr, TWO_MIB as usize) };

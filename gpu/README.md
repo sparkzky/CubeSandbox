@@ -179,21 +179,21 @@ deployment (RTX 3060, driver 615.71):
    and the test binaries (see `gpu/tests/`). The shim only creates sandbox
    state; it does not install the library into the image.
 
-### Remaining integration gaps (found during validation)
+### Resolved during validation
 
-* **Restored containers do not inherit the shim-injected `CUBE_GPU_*`
-  environment.** Templates are memory snapshots, so the container process that
-  starts at restore time carries template-build-time env. The validation
-  supplied `CUBE_GPU_*` explicitly through envd. Production needs either
-  restore-time env injection or a zero-env bootstrap (read `session_id`,
-  `token`, and quota from the IVSHMEM global header).
-* **Guest→host vsock is a Unix-socket proxy in this VMM**:
-  `/run/vc/vm/<sandbox_id>/cube.sock_<port>`. The daemon must bind one listener
-  per sandbox there (or the shim must register the sandbox with the daemon).
-  The validation used a small bridge from that socket to the daemon's AF_VSOCK
-  listener.
+* **Zero-env bootstrap.** Restored containers do not inherit the
+  shim-injected `CUBE_GPU_*` environment. The shim now writes `session_id`,
+  the token, and `memory_quota` into the IVSHMEM global header, and the guest
+  library falls back to those values when the env is absent. Validated with an
+  empty environment: all sandboxes bootstrapped from the header and saw their
+  own 512/256 MiB quotas.
+* **Native per-sandbox vsock transport.** Guest→host virtio-vsock is proxied
+  by the VMM to `/run/vc/vm/<sandbox_id>/cube.sock_<port>`. The daemon now
+  watches `CUBE_GPU_VM_DIR` (default `/run/vc/vm`) and binds a listener for
+  each sandbox on `CUBE_GPU_GUEST_PORT` (default 20565); no external bridge is
+  required.
 * Cleanup of resources already torn down by the client is tolerated
-  (`INVALID_HANDLE`/`INVALID_CONTEXT`), but a Cubelet quarantine hook is still
+  (`INVALID_HANDLE`/`INVALID_CONTEXT`). A Cubelet quarantine hook is still
   absent for genuine cleanup failures.
 
 ## Known limitations

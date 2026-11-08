@@ -107,7 +107,7 @@ static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 static cube_gpu_rpc_client_t g_rpc;
 
 static uint64_t g_sandbox_id = 0;
-static uint64_t g_memory_quota = DEFAULT_MEMORY_QUOTA;
+static uint64_t g_memory_quota = 0; /* 0 -> bootstrap from SHM header */
 static uint32_t g_vsock_cid = DEFAULT_VSOCK_CID;
 static uint32_t g_vsock_port = CUBE_GPU_VSOCK_PORT;
 
@@ -199,7 +199,7 @@ static void initialize(void) {
     g_debug = (dbg && dbg[0] == '1');
 
     g_sandbox_id = env_u64_dec(ENV_SANDBOX_ID, 0);
-    g_memory_quota = env_u64_dec(ENV_MEMORY_QUOTA, DEFAULT_MEMORY_QUOTA);
+    g_memory_quota = env_u64_dec(ENV_MEMORY_QUOTA, 0);
     g_vsock_port = (uint32_t)env_u64_auto(ENV_VSOCK_PORT, CUBE_GPU_VSOCK_PORT);
     g_vsock_cid = (uint32_t)env_u64_auto(ENV_VSOCK_CID, DEFAULT_VSOCK_CID);
 

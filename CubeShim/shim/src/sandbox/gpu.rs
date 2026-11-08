@@ -20,7 +20,8 @@ const CUBE_GPU_SHM_SIZE_MB: u64 = 128;
 //   offset 64 : g2h_offset     u64  (written by the daemon)
 //   offset 72 : h2g_offset     u64  (written by the daemon)
 //   offset 80 : session_id     u64
-//   offset 88 : reserved       [u8; 40]
+//   offset 88 : memory_quota   u64  (bytes; used for env-less bootstrap)
+//   offset 96 : reserved       [u8; 32]
 // The shim owns only the identity fields; the daemon is the sole authority
 // for the ring layout and fills those fields in on attach.
 const SHM_GLOBAL_HEADER_SIZE: usize = 128;
@@ -35,6 +36,7 @@ const OFF_FLAGS: usize = 12;
 const OFF_TOKEN: usize = 16;
 const OFF_TOTAL_SIZE: usize = 48;
 const OFF_SESSION_ID: usize = 80;
+const OFF_MEMORY_QUOTA: usize = 88;
 
 /// Token registry shared by every `GpuIntegration` instance. `sb.rs` creates
 /// the backing file through one instance and `container/mod.rs` later injects
@@ -206,6 +208,8 @@ impl GpuIntegration {
         header[OFF_TOTAL_SIZE..OFF_TOTAL_SIZE + 8].copy_from_slice(&total_size.to_le_bytes());
         // ring_size / g2h_offset / h2g_offset stay 0: the daemon owns layout.
         header[OFF_SESSION_ID..OFF_SESSION_ID + 8].copy_from_slice(&sandbox_id.to_le_bytes());
+        let quota_bytes = self.memory_quota_mb.saturating_mul(1024 * 1024);
+        header[OFF_MEMORY_QUOTA..OFF_MEMORY_QUOTA + 8].copy_from_slice(&quota_bytes.to_le_bytes());
 
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&header)?;

@@ -40,6 +40,26 @@ async fn main() {
 
     let session_mgr = session::SessionManager::new(cuda, shm_mgr);
 
+    // Guest -> host virtio-vsock is proxied by the VMM to
+    // <vm_dir>/<sandbox_id>/cube.sock_<guest_port>; serve each sandbox there.
+    let guest_port = std::env::var("CUBE_GPU_GUEST_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_VSOCK_PORT);
+    let vm_dir = std::env::var("CUBE_GPU_VM_DIR")
+        .unwrap_or_else(|_| "/run/vc/vm".to_string());
+    {
+        let mgr = session_mgr.clone();
+        let dir = vm_dir.clone();
+        info!(
+            "Watching {} for sandbox vsock sockets on guest port {}",
+            dir, guest_port
+        );
+        tokio::spawn(async move {
+            vsock_listener::run_unix_watcher(guest_port, dir, mgr).await;
+        });
+    }
+
     info!("Listening on vsock port {}", port);
     if let Err(e) = vsock_listener::run(port, session_mgr).await {
         error!("Listener error: {:?}", e);

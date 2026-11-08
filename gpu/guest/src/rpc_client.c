@@ -76,7 +76,7 @@ void cube_gpu_rpc_unlock(void) { pthread_mutex_unlock(&g_rpc_mutex); }
 
 /* ─── Socket helpers ──────────────────────────────────────────── */
 
-static int vsock_connect(uint32_t cid, uint32_t port) {
+static int vsock_connect(uint32_t cid, uint32_t port, int quiet) {
     int fd;
     struct sockaddr_vm addr;
 
@@ -92,7 +92,8 @@ static int vsock_connect(uint32_t cid, uint32_t port) {
     addr.svm_port = port;
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        log_err("connect(vsock cid=%u port=%u): %s", cid, port, strerror(errno));
+        if (!quiet)
+            log_err("connect(vsock cid=%u port=%u): %s", cid, port, strerror(errno));
         close(fd);
         return -1;
     }
@@ -402,7 +403,13 @@ int cube_gpu_rpc_client_init(cube_gpu_rpc_client_t *client, uint32_t host_cid,
     dbg = getenv(ENV_DEBUG);
     g_rpc_debug = (dbg && dbg[0] == '1');
 
-    client->vsock_fd = vsock_connect(host_cid, port);
+    /* The daemon may still be binding the per-sandbox unix-vsock socket
+     * (or starting at all), so retry the connect for a few seconds. */
+    for (int attempt = 0; attempt < 100; attempt++) {
+        client->vsock_fd = vsock_connect(host_cid, port, attempt != 99);
+        if (client->vsock_fd >= 0) break;
+        usleep(100 * 1000);
+    }
     if (client->vsock_fd < 0) return -1;
 
     /* The mapping must exist before session_init is sent: the daemon uses
@@ -410,13 +417,45 @@ int cube_gpu_rpc_client_init(cube_gpu_rpc_client_t *client, uint32_t host_cid,
      * same backing file. */
     shm_base = map_shm_file(getenv(ENV_SHM_PATH), &shm_size);
 
+    /* Zero-config bootstrap: when the sandbox was restored from a memory
+     * snapshot the shim-injected environment is not visible to new
+     * processes, but the shim always writes identity into the shared-memory
+     * global header before the VM boots. */
+    parse_shm_token(getenv(ENV_SHM_TOKEN), token);
+    if (shm_base && shm_size >= sizeof(cube_gpu_shm_global_t)) {
+        cube_gpu_shm_global_t gh;
+        memcpy(&gh, shm_base, sizeof(gh));
+        if (gh.magic == CUBE_GPU_SHM_MAGIC) {
+            if (sandbox_id == 0) sandbox_id = gh.session_id;
+            if (memory_quota == 0) memory_quota = gh.memory_quota;
+            if (!token_nonzero(token)) memcpy(token, gh.token, sizeof(token));
+            {
+                uint64_t w72 = 0, w80 = 0, w88 = 0, w96 = 0;
+                memcpy(&w72, (const char *)shm_base + 72, 8);
+                memcpy(&w80, (const char *)shm_base + 80, 8);
+                memcpy(&w88, (const char *)shm_base + 88, 8);
+                memcpy(&w96, (const char *)shm_base + 96, 8);
+                log_dbg("shm header raw: magic=%llx ver=%u w72=%llx w80=%llx w88=%llx w96=%llx",
+                        (unsigned long long)gh.magic, gh.version,
+                        (unsigned long long)w72, (unsigned long long)w80,
+                        (unsigned long long)w88, (unsigned long long)w96);
+            }
+            log_dbg("bootstrap from SHM header: sandbox=%llu quota=%llu",
+                    (unsigned long long)sandbox_id,
+                    (unsigned long long)memory_quota);
+        }
+    }
+    if (memory_quota == 0) {
+        memory_quota = 4ULL * 1024 * 1024 * 1024;
+        log_warn("no memory quota in env or SHM header; defaulting to 4GiB");
+    }
+
     memset(&req, 0, sizeof(req));
     req.memory_quota = memory_quota;
     req.sandbox_id = sandbox_id;
     req.sm_percent = env_u64(ENV_SM_PERCENT, 0);
     req.shm_size_mb = (uint32_t)(shm_size >> 20);
 
-    parse_shm_token(getenv(ENV_SHM_TOKEN), token);
     if (token_nonzero(token)) req.flags |= CUBE_GPU_SESSION_FLAG_TOKEN;
     else log_warn("%s missing/invalid; sending an all-zero token", ENV_SHM_TOKEN);
     memcpy(req.shm_token, token, sizeof(token));

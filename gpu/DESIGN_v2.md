@@ -250,4 +250,4 @@ P0/P1 在现分支迭代；P2 起拆分支；P4 前先在 Discussion #174 评论
 
 为此修复了宿主栈上的真实缺口：CubeAPI/CubeMaster 注解透传、shim restore 路径传递 IVSHMEM、VMM 恢复时允许新增设备、IVSHMEM BAR2 重编程时迁移 KVM slot、guest 库自动 PCI rescan、guest 库消除 GLIBC_2.38 依赖。
 
-仍待集成（见 README）：恢复态容器的 `CUBE_GPU_*` 环境注入（或从共享内存头零配置引导）、daemon 原生监听 VMM 的 per-sandbox Unix vsock 代理路径（验证时用桥接）。
+缺口修复：共享内存全局头新增 `memory_quota`，guest 库在 env 缺失时从头部读取 `session_id`/token/quota（零配置引导，已用空环境验证）；daemon 监听 `CUBE_GPU_VM_DIR`（默认 `/run/vc/vm`）下每个沙箱的 `cube.sock_<guest_port>`，原生接入 VMM 的 Unix vsock 代理（不再需要桥接）。

@@ -38,7 +38,8 @@ pub struct ShmGlobal {
     pub g2h_offset: u64,
     pub h2g_offset: u64,
     pub session_id: u64,
-    pub reserved: [u8; 40],
+    pub memory_quota: u64,
+    pub reserved: [u8; 32],
 }
 
 #[repr(C, packed)]
